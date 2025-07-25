@@ -16,6 +16,9 @@ FROM $BASE_IMAGE
 RUN --mount=type=bind,source=binaries/gradio_videotimeline-1.0.2-py3-none-any.whl,target=/tmp/gradio_videotimeline-1.0.2-py3-none-any.whl \
     pip install --no-deps /tmp/gradio_videotimeline-1.0.2-py3-none-any.whl
 
+# Install Twelve Labs SDK for Marengo and Pegasus integration
+RUN pip install twelvelabs
+
 RUN git clone https://github.com/NVIDIA/context-aware-rag.git -b v0.5.1 /tmp/vss-ctx-rag
 RUN pip install /tmp/vss-ctx-rag --no-deps && \
     rm -rf /tmp/vss-ctx-rag

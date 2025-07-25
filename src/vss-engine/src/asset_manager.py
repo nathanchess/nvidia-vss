@@ -159,6 +159,7 @@ class AssetManager:
         asset_dir: str,
         max_storage_usage_gb=None,
         asset_removal_callback: Callable[[Asset], bool] = None,
+        asset_upload_callback: Callable[[Asset], None] = None,
     ) -> None:
         """Default constructor
 
@@ -168,6 +169,7 @@ class AssetManager:
         self._asset_dir = asset_dir
         self._max_storage_usage_gb = max_storage_usage_gb
         self._asset_removal_callback = asset_removal_callback
+        self._asset_upload_callback = asset_upload_callback
 
         try:
             os.makedirs(self._asset_dir, exist_ok=True)
@@ -266,6 +268,13 @@ class AssetManager:
 
         logger.info(f"[AssetManager] Saved file - asset-id: {asset_id} name: {file_name}")
 
+        # Call upload callback if provided
+        if self._asset_upload_callback:
+            try:
+                self._asset_upload_callback(self._asset_map[asset_id])
+            except Exception as e:
+                logger.warning(f"[AssetManager] Upload callback failed for {asset_id}: {e}")
+
         await self._age_out_assets()
 
         return asset_id
@@ -322,6 +331,14 @@ class AssetManager:
         logger.info(
             f"[AssetManager] Added file from path - asset-id: {asset_id} original path: {file_path}"
         )
+        
+        # Call upload callback if provided
+        if self._asset_upload_callback:
+            try:
+                self._asset_upload_callback(self._asset_map[asset_id])
+            except Exception as e:
+                logger.warning(f"[AssetManager] Upload callback failed for {asset_id}: {e}")
+        
         return asset_id
 
     def add_live_stream(self, url: str, description="", username="", password=""):

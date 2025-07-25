@@ -1289,10 +1289,16 @@ class ViaServer:
     def __init__(self, args) -> None:
         self._args = args
 
+        # Initialize upload handlers from registry
+        from upload_handlers import upload_registry
+        upload_registry.load_handlers_from_config()
+        upload_callback = upload_registry.get_upload_callback()
+
         self._asset_manager = AssetManager(
             args.asset_dir,
             max_storage_usage_gb=args.max_asset_storage_size,
             asset_removal_callback=self._remove_asset,
+            asset_upload_callback=upload_callback,
         )
 
         self._async_executor = ThreadPoolExecutor(

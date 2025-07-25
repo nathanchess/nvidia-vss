@@ -51,6 +51,7 @@ class VlmModelType(Enum):
     VILA_15 = "vila-1.5"
     NVILA = "nvila"
     OPENAI_COMPATIBLE = "openai-compat"  # Any OpenAI API compatible on NIM/OpenAI/Azure-OpenAI
+    TWELVE_LABS = "twelve-labs"  # Unified model: Marengo search → Pegasus summary
 
     def __str__(self):
         return self.value
@@ -228,7 +229,12 @@ class DecoderProcess(ViaProcessBase):
             self._minframes = 1
             # For OpenAI compatible models, JPEG images are used
             self._enable_jpeg_tensors = True
-
+        elif self._vlm_model_type == VlmModelType.TWELVE_LABS:
+            if not self._nfrms:
+                self._nfrms = 10
+            self._minframes = 1
+            # For Twelve Labs models, JPEG images are used
+            self._enable_jpeg_tensors = True
         else:
             self._width = 224
             self._height = 224
@@ -525,6 +531,9 @@ class EmbeddingProcess(ViaProcessBase):
             )
 
             self._emb_generator = FrameJPEGTensorGenerator()
+        elif self._vlm_model_type == VlmModelType.TWELVE_LABS:
+            # Twelve Labs handles embeddings on their cloud service
+            self._emb_generator = None
         elif self._vlm_model_type is None:
             model = CustomModuleLoader(self._model_path).load_model()
             self._emb_generator = model.get_embedding_generator()
@@ -652,7 +661,7 @@ class VlmProcess(ViaProcessBase):
         # Also: torch.cuda_init() from parallel threads without as may GPUs
         # give error:
         # RuntimeError: No CUDA GPUs are available
-        if self._vlm_model_type == VlmModelType.OPENAI_COMPATIBLE:
+        if self._vlm_model_type in [VlmModelType.OPENAI_COMPATIBLE, VlmModelType.TWELVE_LABS]:
             use_gpu_mem_for_embedding_load = False
         self._emb_helper = EmbeddingHelper(
             self._asset_dir, use_gpu_mem=use_gpu_mem_for_embedding_load
@@ -687,6 +696,11 @@ class VlmProcess(ViaProcessBase):
             from models.openai_compat.openai_compat_model import CompOpenAIModel
 
             self._model = CompOpenAIModel(True)
+            self._batch_size = 1
+        elif self._vlm_model_type == VlmModelType.TWELVE_LABS:
+            from models.twelve_labs.twelve_labs_model import TwelveLabsModel
+
+            self._model = TwelveLabsModel(async_output=True)
             self._batch_size = 1
         elif self._vlm_model_type is None:
             loader = CustomModuleLoader(self._model_path)
@@ -749,6 +763,10 @@ class VlmProcess(ViaProcessBase):
             from models.common.model_context_frame_input import ModelContextFrameInput
 
             ctx = ModelContextFrameInput(self._model)
+        elif self._vlm_model_type == VlmModelType.TWELVE_LABS:
+            from models.twelve_labs.twelve_labs_context import TwelveLabsContext
+
+            ctx = TwelveLabsContext(self._model)
         elif self._vlm_model_type is None:
             ctx = CustomModelContext(self._model)
 
@@ -756,7 +774,7 @@ class VlmProcess(ViaProcessBase):
         frame_times = []
         if (
             self._vlm_model_type is not None or self._model.get_embedding_generator() is not None
-        ) and self._vlm_model_type != VlmModelType.NVILA:
+        ) and self._vlm_model_type not in [VlmModelType.NVILA, VlmModelType.TWELVE_LABS]:
             # Model supports explicit embeddings, fetch the embedding for each chunk
             # in the input batch
             for chunk_ in chunk:
@@ -1133,7 +1151,7 @@ class VlmPipeline:
 
         self._start_time = time.time()
         use_gpu_mem_for_embedding_load = True
-        if args.vlm_model_type == VlmModelType.OPENAI_COMPATIBLE:
+        if args.vlm_model_type in [VlmModelType.OPENAI_COMPATIBLE, VlmModelType.TWELVE_LABS]:
             # Embedding sent to network; can avoid GPU mem
             # Also: torch.cuda_init() from parallel threads without as may GPUs
             # give error:
@@ -1572,6 +1590,10 @@ class VlmPipeline:
             from models.nvila.nvila_model import NVila
 
             id, api_type, owned_by = NVila.get_model_info()
+        elif self._args.vlm_model_type == VlmModelType.TWELVE_LABS:
+            from models.twelve_labs.twelve_labs_model import TwelveLabsModel
+
+            id, api_type, owned_by = TwelveLabsModel.get_model_info()
         else:
             id = os.path.basename(os.path.abspath(self._args.model_path))
             api_type = "internal"

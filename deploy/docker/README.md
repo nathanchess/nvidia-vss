@@ -8,5 +8,6 @@ For custom VSS deployments through docker compose, three samples are provided to
 | remote_llm_deployment (LLM, Embedding, Reranker remote) | Local | Remote | Remote | Remote | 1xB200, 1xH200, 1xH100, 2xA100 (80GB), 2xL40S |
 | local_deployment     | Local | Local | Local | Local |  2xB200, 8xH200, 8xH100, 8xA100 (80GB), 8xL40S |
 | local_deployment_single_gpu | Local | Local | Local | Local |  B200, H200, H100, A100 (80GB) |
+| twelve_labs_deployment | Twelve Labs Cloud | Remote | Remote | Remote | Minimum 8GB VRAM GPU (for CV pipeline only) |
 
 For further details on deploying VSS with these docker compose examples, visit the [Custom Deployment Page](https://docs.nvidia.com/vss) in the VSS Documentation. 
