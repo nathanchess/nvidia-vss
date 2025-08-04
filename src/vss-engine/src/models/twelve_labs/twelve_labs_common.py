@@ -21,7 +21,89 @@ from via_logger import logger
 ASSET_STORAGE_DIR = os.environ.get("ASSET_STORAGE_DIR")
 
 
+class TwelveLabsConfig:
+    """Configuration class for Twelve Labs integration."""
+    
+    def __init__(self):
+        # API Configuration
+        self.api_key = self._get_env_var("TWELVE_LABS_API_KEY")
+        self.api_url = self._get_env_var("TWELVE_LABS_API_URL", "https://api.twelvelabs.io")
+        
+        # Index Configuration
+        self.marengo_index_name = self._get_env_var("TWELVE_LABS_MARENGO_INDEX_NAME", "vss-marengo-index")
+        self.pegasus_index_name = self._get_env_var("TWELVE_LABS_PEGASUS_INDEX_NAME", "vss-pegasus-index")
+        self.marengo_model = self._get_env_var("TWELVE_LABS_MARENGO_MODEL", "marengo-2.7")
+        self.pegasus_model = self._get_env_var("TWELVE_LABS_PEGASUS_MODEL", "pegasus-1")
+        
+        # Search Options
+        self.marengo_options = self._get_env_list("TWELVE_LABS_MARENGO_OPTIONS", ["visual", "audio"])
+        self.pegasus_options = self._get_env_list("TWELVE_LABS_PEGASUS_OPTIONS", ["visual", "audio"])
+        self.search_options = self._get_env_list("TWELVE_LABS_SEARCH_OPTIONS", ["visual", "audio"])
+        
+        # Search Parameters
+        self.max_clips = self._get_env_int("TWELVE_LABS_MAX_CLIPS", 10)
+        self.max_clips_for_analysis = self._get_env_int("TWELVE_LABS_MAX_CLIPS_FOR_ANALYSIS", 3)
+        self.search_threshold = self._get_env_var("TWELVE_LABS_SEARCH_THRESHOLD", "medium")
+        
+        # Analysis Parameters
+        self.analysis_temperature = self._get_env_float("TWELVE_LABS_ANALYSIS_TEMPERATURE", 0.7)
+        
+        # Upload Configuration
+        self.upload_timeout = self._get_env_int("TWELVE_LABS_UPLOAD_TIMEOUT", 600)
+        self.auto_upload_enabled = self._get_env_bool("VSS_ENABLE_TWELVE_LABS_AUTO_UPLOAD", False)
+        
+        # Retry Configuration
+        self.max_retries = self._get_env_int("TWELVE_LABS_MAX_RETRIES", 3)
+        self.retry_delay_base = self._get_env_int("TWELVE_LABS_RETRY_DELAY_BASE", 2)
+        
+    def _get_env_var(self, key: str, default: str = None) -> str:
+        value = os.environ.get(key, default)
+        if value is None:
+            logger.warning(f"Environment variable {key} not set")
+        return value
+    
+    def _get_env_int(self, key: str, default: int) -> int:
+        try:
+            return int(os.environ.get(key, str(default)))
+        except ValueError:
+            logger.warning(f"Invalid integer value for {key}, using default: {default}")
+            return default
+    
+    def _get_env_float(self, key: str, default: float) -> float:
+        try:
+            return float(os.environ.get(key, str(default)))
+        except ValueError:
+            logger.warning(f"Invalid float value for {key}, using default: {default}")
+            return default
+    
+    def _get_env_bool(self, key: str, default: bool) -> bool:
+        value = os.environ.get(key, str(default)).lower()
+        return value in ('true', '1', 'yes', 'on')
+    
+    def _get_env_list(self, key: str, default: list) -> list:
+        value = os.environ.get(key)
+        if value:
+            return [item.strip() for item in value.split(',')]
+        return default
+    
+    def validate(self) -> bool:
+        """Validate the configuration."""
+        if not self.api_key:
+            logger.error("TWELVE_LABS_API_KEY is required")
+            return False
+        
+        if not ASSET_STORAGE_DIR:
+            logger.error("ASSET_STORAGE_DIR is required")
+            return False
+            
+        return True
+
+
 class VideoIDMapper:
+    # Cache for video ID mappings to avoid repeated file I/O
+    _mapping_cache = {}
+    _cache_max_size = 1000
+    
     @staticmethod
     def save_mapping(vss_file_id: str, marengo_video_id: str = None, 
                      pegasus_video_id: str = None, marengo_index_id: str = None,
@@ -49,15 +131,74 @@ class VideoIDMapper:
         
         with open(mapping_file, 'w') as f:
             json.dump(mapping, f)
+        
+        # Update cache
+        VideoIDMapper._update_cache(vss_file_id, mapping)
     
     @staticmethod
     def get_mapping(vss_file_id: str) -> Optional[Dict]:
-        for file_id in [vss_file_id, vss_file_id.replace("-", "")]:
+        # Check cache first
+        if vss_file_id in VideoIDMapper._mapping_cache:
+            return VideoIDMapper._mapping_cache[vss_file_id]
+        
+        # Check alternative file ID format in cache
+        alt_file_id = vss_file_id.replace("-", "")
+        if alt_file_id in VideoIDMapper._mapping_cache:
+            return VideoIDMapper._mapping_cache[alt_file_id]
+        
+        # Load from file system
+        for file_id in [vss_file_id, alt_file_id]:
             mapping_file = Path(ASSET_STORAGE_DIR) / file_id / "twelve_labs_mapping.json"
             if mapping_file.exists():
                 with open(mapping_file, 'r') as f:
-                    return json.load(f)
+                    mapping = json.load(f)
+                    VideoIDMapper._update_cache(file_id, mapping)
+                    return mapping
         return None
+    
+    @staticmethod
+    def _update_cache(vss_file_id: str, mapping: Dict) -> None:
+        """Update the mapping cache, implementing LRU eviction."""
+        if len(VideoIDMapper._mapping_cache) >= VideoIDMapper._cache_max_size:
+            # Remove oldest item (simple FIFO for now)
+            oldest_key = next(iter(VideoIDMapper._mapping_cache))
+            del VideoIDMapper._mapping_cache[oldest_key]
+        
+        VideoIDMapper._mapping_cache[vss_file_id] = mapping
+    
+    @staticmethod
+    def get_pegasus_for_marengo(marengo_video_id: str) -> Optional[str]:
+        """Optimized lookup to get Pegasus video ID for a given Marengo video ID."""
+        # First check cache for reverse mapping
+        for cached_mapping in VideoIDMapper._mapping_cache.values():
+            if cached_mapping.get("marengo_video_id") == marengo_video_id:
+                pegasus_id = cached_mapping.get("pegasus_video_id")
+                if pegasus_id:
+                    logger.debug(f"Found Pegasus video ID {pegasus_id} in cache for Marengo video ID {marengo_video_id}")
+                    return pegasus_id
+        
+        # If not in cache, do file system scan (but cache results)
+        if not ASSET_STORAGE_DIR:
+            return None
+            
+        for asset_dir in Path(ASSET_STORAGE_DIR).iterdir():
+            if asset_dir.is_dir():
+                mapping_file = asset_dir / "twelve_labs_mapping.json"
+                if mapping_file.exists():
+                    # Load and cache the mapping
+                    mapping = VideoIDMapper.get_mapping(asset_dir.name)
+                    if mapping and mapping.get("marengo_video_id") == marengo_video_id:
+                        pegasus_video_id = mapping.get("pegasus_video_id")
+                        logger.debug(f"Found Pegasus video ID {pegasus_video_id} for Marengo video ID {marengo_video_id}")
+                        return pegasus_video_id
+        
+        logger.warning(f"No Pegasus video ID found for Marengo video {marengo_video_id}")
+        return None
+    
+    @staticmethod
+    def clear_cache():
+        """Clear the mapping cache. Useful for testing or memory management."""
+        VideoIDMapper._mapping_cache.clear()
     
     @staticmethod
     def get_video_path(vss_file_id: str) -> Optional[Path]:
@@ -71,11 +212,13 @@ class VideoIDMapper:
         return None
 
 
-def wait_for_task_completion(client, task_id: str) -> Dict:
-    max_wait_seconds = int(os.environ.get("TWELVE_LABS_UPLOAD_TIMEOUT"))
+def wait_for_task_completion(client, task_id: str, timeout_seconds: int = None) -> Dict:
+    if timeout_seconds is None:
+        timeout_seconds = int(os.environ.get("TWELVE_LABS_UPLOAD_TIMEOUT", "600"))
+    
     start_time = time.time()
     
-    while time.time() - start_time < max_wait_seconds:
+    while time.time() - start_time < timeout_seconds:
         try:
             task = client.task.retrieve(task_id)
             
@@ -91,6 +234,22 @@ def wait_for_task_completion(client, task_id: str) -> Dict:
             time.sleep(5)
     
     return {"status": "timeout", "error": "Upload timeout"}
+
+
+def retry_with_exponential_backoff(func, max_retries: int = 3, base_delay: int = 2):
+    """Retry a function with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            
+            delay = base_delay ** attempt
+            logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay}s...")
+            time.sleep(delay)
+    
+    return None
 
 
 def ensure_index_exists(client, index_name: str, engine_name: str, engine_options: list) -> str:

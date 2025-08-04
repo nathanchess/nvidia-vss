@@ -12,14 +12,15 @@
 
 import os
 import time
-from typing import List, Optional, Dict
+import json
+from typing import List, Optional, Dict, Generator, Any
 
 import torch
 
 from base_class import CustomModelBase, EmbeddingGeneratorBase, VlmGenerationConfig
 from chunk_info import ChunkInfo
 from via_logger import TimeMeasure, logger
-from .twelve_labs_common import VideoIDMapper, wait_for_task_completion, ensure_index_exists
+from .twelve_labs_common import VideoIDMapper, wait_for_task_completion, ensure_index_exists, TwelveLabsConfig, retry_with_exponential_backoff
 
 try:
     from twelvelabs import TwelveLabs
@@ -31,19 +32,19 @@ except ImportError:
 class TwelveLabsModel(CustomModelBase):
     def __init__(self, async_output: bool = True):
         self._client = None
+        self._config = TwelveLabsConfig()
         self._initialize_client()
         
     def _initialize_client(self):
         if TwelveLabs is None:
             raise ImportError("TwelveLabs SDK not installed")
         
-        api_key = os.environ.get("TWELVE_LABS_API_KEY")
-        if not api_key:
-            logger.warning("TWELVE_LABS_API_KEY not set")
+        if not self._config.validate():
+            logger.error("Invalid Twelve Labs configuration")
             return
             
         try:
-            self._client = TwelveLabs(api_key=api_key)
+            self._client = TwelveLabs(api_key=self._config.api_key)
             indexes = list(self._client.index.list())
             logger.info(f"Connected to Twelve Labs. Found {len(indexes)} indexes")
         except Exception as e:
@@ -57,29 +58,106 @@ class TwelveLabsModel(CustomModelBase):
         
         if isinstance(generation_config, dict):
             prompt = generation_config.get("prompt")
+            stream = generation_config.get("stream", False)
         else:
             prompt = getattr(generation_config, "prompt", None) if generation_config else None
+            stream = getattr(generation_config, "stream", False) if generation_config else False
         
         if not prompt:
             return {"text": "No prompt provided"}
         
-        result = self._search_and_summarize(prompt)
-        return {"text": result["text"]}
+        # Check if this is a search request with parameters
+        analyze_mode = False
+        max_clips = self._config.max_clips
+        threshold = self._config.search_threshold
+        
+        # Parse search parameters from prompt if present
+        if "[ANALYZE:" in prompt:
+            import re
+            # Extract parameters from prompt
+            analyze_match = re.search(r'\[ANALYZE:\s*true.*?\]', prompt)
+            if analyze_match:
+                analyze_mode = True
+                # Extract MAX_CLIPS parameter
+                clips_match = re.search(r'MAX_CLIPS:\s*(\d+)', prompt)
+                if clips_match:
+                    max_clips = int(clips_match.group(1))
+                # Extract THRESHOLD parameter
+                threshold_match = re.search(r'THRESHOLD:\s*(\w+)', prompt)
+                if threshold_match:
+                    threshold = threshold_match.group(1)
+                
+                # Clean the prompt by removing the parameter section
+                prompt = re.sub(r'\s*\[ANALYZE:.*?\]', '', prompt).strip()
+        
+        # Update config with search parameters
+        if max_clips != self._config.max_clips:
+            self._config.max_clips = max_clips
+        if threshold != self._config.search_threshold:
+            self._config.search_threshold = threshold
+        
+        if analyze_mode or not "[ANALYZE:" in str(generation_config):
+            # Use search and analyze workflow
+            if stream:
+                return self._search_and_analyze_stream(prompt)
+            else:
+                result = self._search_and_analyze(prompt)
+                return {"text": result["text"]}
+        else:
+            # For pure search (no analysis), return search results only
+            result = self._search_only(prompt)
+            return {"text": result["text"]}
     
-    def _search_and_summarize(self, prompt: str) -> dict:
-        """Execute the search workflow: Marengo search → Pegasus summary.
+    def _search_only(self, prompt: str) -> dict:
+        """Execute search-only workflow: return clips without analysis."""
+        try:
+            logger.info(f"Starting search-only workflow")
+            
+            marengo_index_id = self._get_marengo_index_id()
+            
+            logger.info("Searching across all previously uploaded videos")
+            relevant_clips = self._marengo_search_all(prompt, marengo_index_id)
+            if not relevant_clips or len(relevant_clips) == 0:
+                logger.warning("No relevant clips found")
+                return {
+                    "text": f"No relevant clips found for query: {prompt}",
+                    "workflow": "marengo_search_no_results"
+                }
+            
+            # Format search results without analysis
+            search_results = f"Found {len(relevant_clips)} relevant clips for query: {prompt}\n\n"
+            
+            for i, clip in enumerate(relevant_clips[:10]):  # Show top 10 clips
+                video_title = clip.get('video_title', f"Video {clip['video_id'][:8]}")
+                search_results += f"{i+1}. {video_title}\n"
+                search_results += f"   Time: {clip['start']:.1f}s - {clip['end']:.1f}s\n"
+                search_results += f"   Score: {clip['score']:.2f}\n"
+                search_results += f"   Confidence: {clip['confidence']}\n\n"
+            
+            return {
+                "text": search_results,
+                "clips_found": len(relevant_clips),
+                "workflow": "marengo_search_only"
+            }
+            
+        except Exception as e:
+            logger.error(f"Twelve Labs search error: {e}")
+            return {"text": f"Search error: {str(e)}", "error": True}
+    
+    def _search_and_analyze(self, prompt: str) -> dict:
+        """Execute the search workflow: Marengo search → Pegasus analysis.
         
         Searches across ALL videos that have already been uploaded to Twelve Labs.
-        Videos should be uploaded during VSS upload, not during search.
+        Uses multiple clips for richer analysis.
         
         Args:
             prompt: User search prompt
             
         Returns:
-            Final summary result from matching clips across all videos
+            Final analysis result from matching clips across all videos
         """
         try:
-            logger.info(f"Starting search workflow: Marengo search → Pegasus summary")
+            logger.info(f"Starting search workflow: Marengo search → Pegasus analysis")
             
             marengo_index_id = self._get_marengo_index_id()
             pegasus_index_id = self._get_pegasus_index_id()
@@ -93,41 +171,82 @@ class TwelveLabsModel(CustomModelBase):
                     "workflow": "marengo_search_no_results"
                 }
             
-            logger.info("Generating summary from found clips")
-            summary = self._pegasus_summarize_clips(prompt, relevant_clips, pegasus_index_id)
+            logger.info("Generating analysis from found clips")
+            analysis = self._pegasus_analyze_clips(prompt, relevant_clips, pegasus_index_id)
             
             return {
-                "text": summary,
+                "text": analysis,
                 "clips_found": len(relevant_clips),
-                "workflow": "marengo_search_pegasus_summary"
+                "workflow": "marengo_search_pegasus_analysis"
             }
             
         except Exception as e:
             logger.error(f"Twelve Labs search error: {e}")
             return {"text": f"Search error: {str(e)}", "error": True}
     
+    def _search_and_analyze_stream(self, prompt: str) -> Generator[dict, None, None]:
+        """Execute the search workflow with streaming response.
+        
+        Args:
+            prompt: User search prompt
+            
+        Yields:
+            Streaming response chunks in VSS format
+        """
+        try:
+            logger.info(f"Starting streaming search workflow")
+            
+            marengo_index_id = self._get_marengo_index_id()
+            pegasus_index_id = self._get_pegasus_index_id()
+            
+            # Yield initial status
+            yield {"choices": [{"delta": {"content": "Searching across all videos...\n"}}]}
+            
+            relevant_clips = self._marengo_search_all(prompt, marengo_index_id)
+            if not relevant_clips or len(relevant_clips) == 0:
+                yield {"choices": [{"message": {"content": f"No relevant clips found for query: {prompt}"}}]}
+                return
+            
+            yield {"choices": [{"delta": {"content": f"Found {len(relevant_clips)} relevant clips. Analyzing...\n"}}]}
+            
+            # Stream the analysis
+            for chunk in self._pegasus_analyze_clips_stream(prompt, relevant_clips, pegasus_index_id):
+                yield chunk
+                
+        except Exception as e:
+            logger.error(f"Twelve Labs streaming search error: {e}")
+            yield {"choices": [{"message": {"content": f"Search error: {str(e)}"}}]}
+    
     def _get_marengo_index_id(self):
-        marengo_index_name = os.environ.get("TWELVE_LABS_MARENGO_INDEX_NAME")
-        marengo_model_name = os.environ.get("TWELVE_LABS_MARENGO_MODEL")
-        marengo_options = os.environ.get("TWELVE_LABS_MARENGO_OPTIONS").split(",")
-        marengo_index_id = ensure_index_exists(
-            self._client,
-            marengo_index_name,
-            marengo_model_name,
-            marengo_options
+        def create_index():
+            return ensure_index_exists(
+                self._client,
+                self._config.marengo_index_name,
+                self._config.marengo_model,
+                self._config.marengo_options
+            )
+        
+        marengo_index_id = retry_with_exponential_backoff(
+            create_index,
+            self._config.max_retries,
+            self._config.retry_delay_base
         )
         logger.info(f"Marengo index ready: {marengo_index_id}")
         return marengo_index_id
     
     def _get_pegasus_index_id(self):
-        pegasus_index_name = os.environ.get("TWELVE_LABS_PEGASUS_INDEX_NAME")
-        pegasus_model_name = os.environ.get("TWELVE_LABS_PEGASUS_MODEL")
-        pegasus_options = os.environ.get("TWELVE_LABS_PEGASUS_OPTIONS").split(",")
-        pegasus_index_id = ensure_index_exists(
-            self._client,
-            pegasus_index_name,
-            pegasus_model_name,
-            pegasus_options
+        def create_index():
+            return ensure_index_exists(
+                self._client,
+                self._config.pegasus_index_name,
+                self._config.pegasus_model,
+                self._config.pegasus_options
+            )
+        
+        pegasus_index_id = retry_with_exponential_backoff(
+            create_index,
+            self._config.max_retries,
+            self._config.retry_delay_base
         )
         logger.info(f"Pegasus index ready: {pegasus_index_id}")
         return pegasus_index_id
@@ -209,17 +328,21 @@ class TwelveLabsModel(CustomModelBase):
         try:
             logger.info(f"Marengo search across all videos: '{query}'")
             
-            search_options = os.environ.get("TWELVE_LABS_SEARCH_OPTIONS").split(",")
-            max_clips = int(os.environ.get("TWELVE_LABS_MAX_CLIPS"))
+            def perform_search():
+                return self._client.search.query(
+                    index_id=marengo_index_id,
+                    options=self._config.search_options,
+                    query_text=query,
+                    group_by="clip",  # Get individual clips
+                    threshold=self._config.search_threshold,
+                    page_limit=self._config.max_clips,
+                    sort_option="score"
+                )
             
-            search_results = self._client.search.query(
-                index_id=marengo_index_id,
-                options=search_options,  # ["visual", "audio"]
-                query_text=query,
-                group_by="clip",  # Get individual clips
-                threshold="medium",  # Medium confidence threshold
-                page_limit=max_clips,
-                sort_option="score"
+            search_results = retry_with_exponential_backoff(
+                perform_search,
+                self._config.max_retries,
+                self._config.retry_delay_base
             )
             
             clips = []
@@ -252,64 +375,145 @@ class TwelveLabsModel(CustomModelBase):
             logger.error(f"Marengo search error: {e}")
             return []
     
-    def _pegasus_summarize_clips(self, prompt: str, clips: List[Dict], pegasus_index_id: str) -> str:
+    def _pegasus_analyze_clips(self, prompt: str, clips: List[Dict], pegasus_index_id: str) -> str:
         try:
-            logger.info(f"Pegasus summarization: {len(clips)} clips")
+            logger.info(f"Pegasus analysis: {len(clips)} clips")
             
-            best_clip = clips[0]
-            video_title = best_clip.get('video_title', f"Video {best_clip['video_id'][:8]}")
+            # Use multiple clips for richer analysis
+            top_clips = clips[:min(len(clips), self._config.max_clips_for_analysis)]
             
-            summary_prompt = f"""Question: {prompt}
+            # Build context from multiple clips
+            clips_context = []
+            pegasus_video_ids = set()
+            
+            for clip in top_clips:
+                video_title = clip.get('video_title', f"Video {clip['video_id'][:8]}")
+                pegasus_video_id = self._get_pegasus_video_id_for_marengo(clip['video_id'])
+                if pegasus_video_id:
+                    pegasus_video_ids.add(pegasus_video_id)
+                    clips_context.append({
+                        'video_id': pegasus_video_id,
+                        'title': video_title,
+                        'start': clip['start'],
+                        'end': clip['end'],
+                        'score': clip['score']
+                    })
+            
+            if not clips_context:
+                return "Could not generate analysis - video mapping not found"
+            
+            # Use the best clip's video for analysis, but include context from others
+            primary_video_id = clips_context[0]['video_id']
+            
+            analysis_prompt = f"""Question: {prompt}
 
-Analyze this video segment: {video_title} ({best_clip['start']:.1f}s - {best_clip['end']:.1f}s)
-
-Provide a summary that answers the question."""
+Relevant video segments found:
+"""
+            for i, clip in enumerate(clips_context[:3]):  # Show top 3 clips
+                analysis_prompt += f"{i+1}. {clip['title']} ({clip['start']:.1f}s - {clip['end']:.1f}s) - Score: {clip['score']:.2f}\n"
             
-            best_marengo_video_id = clips[0]['video_id'] if clips else None
-            if not best_marengo_video_id:
-                return "No clips found"
+            analysis_prompt += f"\nAnalyze the content and provide a comprehensive answer to the question."
             
-            pegasus_video_id = None
-            
-            import os
-            from pathlib import Path
-            asset_storage_dir = os.environ.get("ASSET_STORAGE_DIR")
-            
-            for asset_dir in Path(asset_storage_dir).iterdir():
-                if asset_dir.is_dir():
-                    mapping_file = asset_dir / "twelve_labs_mapping.json"
-                    if mapping_file.exists():
-                        mapping = VideoIDMapper.get_mapping(asset_dir.name)
-                        if mapping and mapping.get("marengo_video_id") == best_marengo_video_id:
-                            pegasus_video_id = mapping.get("pegasus_video_id")
-                            logger.info(f"Found Pegasus video ID {pegasus_video_id} for Marengo video ID {best_marengo_video_id}")
-                            break
-            
-            if not pegasus_video_id:
-                logger.error(f"No Pegasus video ID found for Marengo video {best_marengo_video_id}")
-                return "Could not generate summary - video mapping not found"
-            
-            response = self._client.summarize(
-                video_id=pegasus_video_id,
-                type="summary",  # Generate a summary
-                prompt=summary_prompt,
-                temperature=0.7
+            # Use analyze instead of summarize for custom prompts
+            response = self._client.analyze(
+                video_id=primary_video_id,
+                prompt=analysis_prompt,
+                temperature=self._config.analysis_temperature
             )
             
-            if hasattr(response, 'summary') and response.summary:
-                summary_text = response.summary
-                logger.info(f"Summary generated: {len(summary_text)} chars")
+            if hasattr(response, 'text') and response.text:
+                analysis_text = response.text
+                logger.info(f"Analysis generated: {len(analysis_text)} chars")
             else:
-                logger.warning(f"No summary in response: {type(response)}")
-                summary_text = "Summary generation failed"
+                logger.warning(f"No analysis in response: {type(response)}")
+                video_count = len(set(clip['video_id'] for clip in clips))
+                analysis_text = f"Found {len(clips)} relevant clips from {video_count} videos for query: {prompt}"
             
-            logger.info("Pegasus summarization completed")
-            return summary_text
+            logger.info("Pegasus analysis completed")
+            return analysis_text
             
         except Exception as e:
-            logger.error(f"Pegasus summarization error: {e}")
+            logger.error(f"Pegasus analysis error: {e}")
             video_count = len(set(clip['video_id'] for clip in clips))
             return f"Found {len(clips)} relevant clips from {video_count} videos for query: {prompt}"
+    
+    def _pegasus_analyze_clips_stream(self, prompt: str, clips: List[Dict], pegasus_index_id: str) -> Generator[dict, None, None]:
+        """Stream analysis results from Pegasus."""
+        try:
+            logger.info(f"Pegasus streaming analysis: {len(clips)} clips")
+            
+            # Use multiple clips for richer analysis
+            top_clips = clips[:min(len(clips), self._config.max_clips_for_analysis)]
+            
+            # Build context from multiple clips
+            clips_context = []
+            for clip in top_clips:
+                video_title = clip.get('video_title', f"Video {clip['video_id'][:8]}")
+                pegasus_video_id = self._get_pegasus_video_id_for_marengo(clip['video_id'])
+                if pegasus_video_id:
+                    clips_context.append({
+                        'video_id': pegasus_video_id,
+                        'title': video_title,
+                        'start': clip['start'],
+                        'end': clip['end'],
+                        'score': clip['score']
+                    })
+            
+            if not clips_context:
+                yield {"choices": [{"message": {"content": "Could not generate analysis - video mapping not found"}}]}
+                return
+            
+            # Use the best clip's video for analysis
+            primary_video_id = clips_context[0]['video_id']
+            
+            analysis_prompt = f"""Question: {prompt}
+
+Relevant video segments found:
+"""
+            for i, clip in enumerate(clips_context[:3]):  # Show top 3 clips
+                analysis_prompt += f"{i+1}. {clip['title']} ({clip['start']:.1f}s - {clip['end']:.1f}s) - Score: {clip['score']:.2f}\n"
+            
+            analysis_prompt += f"\nAnalyze the content and provide a comprehensive answer to the question."
+            
+            # Use streaming analyze
+            try:
+                for chunk in self._client.analyze_stream(
+                    video_id=primary_video_id,
+                    prompt=analysis_prompt,
+                    temperature=self._config.analysis_temperature
+                ):
+                    if hasattr(chunk, 'text') and chunk.text:
+                        yield {"choices": [{"delta": {"content": chunk.text}}]}
+                    elif hasattr(chunk, 'content') and chunk.content:
+                        yield {"choices": [{"delta": {"content": chunk.content}}]}
+                        
+                # Send completion marker
+                yield {"choices": [{"delta": {"content": ""}, "finish_reason": "stop"}]}
+                
+            except Exception as stream_error:
+                logger.warning(f"Streaming failed, falling back to regular analysis: {stream_error}")
+                # Fallback to non-streaming
+                response = self._client.analyze(
+                    video_id=primary_video_id,
+                    prompt=analysis_prompt,
+                    temperature=self._config.analysis_temperature
+                )
+                
+                if hasattr(response, 'text') and response.text:
+                    yield {"choices": [{"message": {"content": response.text}}]}
+                else:
+                    video_count = len(set(clip['video_id'] for clip in clips))
+                    yield {"choices": [{"message": {"content": f"Found {len(clips)} relevant clips from {video_count} videos for query: {prompt}"}}]}
+            
+        except Exception as e:
+            logger.error(f"Pegasus streaming analysis error: {e}")
+            video_count = len(set(clip['video_id'] for clip in clips))
+            yield {"choices": [{"message": {"content": f"Found {len(clips)} relevant clips from {video_count} videos for query: {prompt}"}}]}
+    
+    def _get_pegasus_video_id_for_marengo(self, marengo_video_id: str) -> Optional[str]:
+        """Get the corresponding Pegasus video ID for a Marengo video ID."""
+        # Use optimized lookup from VideoIDMapper
+        return VideoIDMapper.get_pegasus_for_marengo(marengo_video_id)
     
     def get_embedding_generator(self):
         return None
