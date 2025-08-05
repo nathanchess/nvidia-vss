@@ -201,6 +201,47 @@ class VideoIDMapper:
         VideoIDMapper._mapping_cache.clear()
     
     @staticmethod
+    def get_vss_id_for_marengo(marengo_video_id: str) -> Optional[str]:
+        """Get VSS file ID for a given Marengo video ID."""
+        logger.info(f"Looking up VSS file ID for Marengo video ID: {marengo_video_id}")
+        logger.info(f"ASSET_STORAGE_DIR: {ASSET_STORAGE_DIR}")
+        logger.info(f"Cache size: {len(VideoIDMapper._mapping_cache)}")
+        
+        # First check cache for reverse mapping
+        for vss_id, cached_mapping in VideoIDMapper._mapping_cache.items():
+            logger.debug(f"Checking cache entry {vss_id}: {cached_mapping}")
+            if cached_mapping.get("marengo_video_id") == marengo_video_id:
+                logger.info(f"Found VSS file ID {vss_id} in cache for Marengo video ID {marengo_video_id}")
+                return vss_id
+        
+        # If not in cache, do file system scan
+        if not ASSET_STORAGE_DIR:
+            logger.error("ASSET_STORAGE_DIR is not set")
+            return None
+            
+        logger.info(f"Scanning asset directories in {ASSET_STORAGE_DIR}")
+        for asset_dir in Path(ASSET_STORAGE_DIR).iterdir():
+            if asset_dir.is_dir():
+                logger.debug(f"Checking directory: {asset_dir.name}")
+                mapping_file = asset_dir / "twelve_labs_mapping.json"
+                if mapping_file.exists():
+                    # Load and cache the mapping
+                    mapping = VideoIDMapper.get_mapping(asset_dir.name)
+                    logger.debug(f"Loaded mapping for {asset_dir.name}: {mapping}")
+                    if mapping and mapping.get("marengo_video_id") == marengo_video_id:
+                        vss_file_id = mapping.get("vss_file_id", asset_dir.name)
+                        logger.info(f"Found VSS file ID {vss_file_id} for Marengo video ID {marengo_video_id}")
+                        return vss_file_id
+                else:
+                    logger.debug(f"No mapping file found in {asset_dir}")
+        
+        logger.warning(f"No VSS file ID found for Marengo video {marengo_video_id}")
+        logger.info("Available mappings:")
+        for vss_id, mapping in VideoIDMapper._mapping_cache.items():
+            logger.info(f"  {vss_id}: marengo_video_id={mapping.get('marengo_video_id')}")
+        return None
+    
+    @staticmethod
     def get_video_path(vss_file_id: str) -> Optional[Path]:
         for file_id in [vss_file_id, vss_file_id.replace("-", "")]:
             asset_dir = Path(ASSET_STORAGE_DIR) / file_id

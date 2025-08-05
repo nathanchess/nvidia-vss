@@ -53,6 +53,9 @@ class TwelveLabsModel(CustomModelBase):
     
     def generate(self, chunks: List[ChunkInfo], frames: torch.Tensor, frame_times: List[float], 
                  generation_config: VlmGenerationConfig = None, **kwargs) -> dict:
+        """Generate video summarization using Twelve Labs Pegasus model ONLY."""
+        logger.info(f"TwelveLabsModel.generate() called with {len(chunks) if chunks else 0} chunks")
+        
         if self._client is None:
             return {"text": "Client not available"}
         
@@ -66,47 +69,205 @@ class TwelveLabsModel(CustomModelBase):
         if not prompt:
             return {"text": "No prompt provided"}
         
-        # Check if this is a search request with parameters
-        analyze_mode = False
-        max_clips = self._config.max_clips
-        threshold = self._config.search_threshold
+        # This method is ONLY for summarization - NEVER do search
+        if not chunks or len(chunks) == 0:
+            logger.error("generate() method called without chunks - this should ONLY be used for summarization")
+            return {"text": "ERROR: generate() method requires video chunks for summarization. Use search() method for search queries.", "error": True}
         
-        # Parse search parameters from prompt if present
-        if "[ANALYZE:" in prompt:
+        logger.info(f"Starting Pegasus video summarization for {len(chunks)} chunks")
+        if stream:
+            return self._summarize_video_stream(prompt, chunks)
+        else:
+            result = self._summarize_video(prompt, chunks)
+            return {"text": result["text"]}
+    
+    def _summarize_video(self, prompt: str, chunks: List[ChunkInfo]) -> dict:
+        """Execute video summarization using Twelve Labs Pegasus model."""
+        try:
+            logger.info(f"Starting video summarization for {len(chunks)} chunks")
+            
+            # Get the video file path from the first chunk
+            if not chunks or len(chunks) == 0:
+                return {"text": "No video chunks provided for summarization", "error": True}
+            
+            # Get the VSS file ID from the chunk info
+            chunk = chunks[0]
+            video_file_path = chunk.file if hasattr(chunk, 'file') else None
+            
+            if not video_file_path:
+                return {"text": "Unable to determine video file path from chunks", "error": True}
+            
+            # Extract VSS file ID from the path (typically in format: ./assets/{vss_id}/video.mp4)
             import re
-            # Extract parameters from prompt
-            analyze_match = re.search(r'\[ANALYZE:\s*true.*?\]', prompt)
-            if analyze_match:
-                analyze_mode = True
-                # Extract MAX_CLIPS parameter
-                clips_match = re.search(r'MAX_CLIPS:\s*(\d+)', prompt)
-                if clips_match:
-                    max_clips = int(clips_match.group(1))
-                # Extract THRESHOLD parameter
-                threshold_match = re.search(r'THRESHOLD:\s*(\w+)', prompt)
-                if threshold_match:
-                    threshold = threshold_match.group(1)
+            path_parts = str(video_file_path).split('/')
+            vss_file_id = None
+            for part in path_parts:
+                if re.match(r'^[0-9a-f-]{36}$', part):  # UUID format
+                    vss_file_id = part
+                    break
+            
+            if not vss_file_id:
+                return {"text": f"Unable to extract VSS file ID from path: {video_file_path}", "error": True}
+            
+            logger.info(f"Summarizing video with VSS ID: {vss_file_id}")
+            
+            # Ensure the video is uploaded to Twelve Labs
+            upload_result = self.ensure_video_uploaded(vss_file_id)
+            if upload_result.get("error"):
+                return upload_result
+            
+            pegasus_video_id = upload_result.get("pegasus_video_id")
+            if not pegasus_video_id:
+                return {"text": "Failed to get Pegasus video ID for summarization", "error": True}
+            
+            # Use Twelve Labs Pegasus for actual video summarization
+            pegasus_index_id = self._get_pegasus_index_id()
+            
+            logger.info(f"Using Pegasus to summarize video {pegasus_video_id}")
+            response = self._client.summarize(
+                video_id=pegasus_video_id,
+                prompt=prompt,
+                temperature=self._config.analysis_temperature,
+                type="summary"
+            )
+            
+            logger.info(f"Result ID: {response.id}")
+            
+            if response.summary is not None:
+                summary_text = response.summary
+                logger.info(f"Video summarization completed: {len(summary_text)} chars")
+            else:
+                logger.warning(f"No summary in response: {type(response)}")
+                summary_text = f"Unable to generate summary for video {vss_file_id}"
+            
+            return {
+                "text": summary_text,
+                "vss_file_id": vss_file_id,
+                "pegasus_video_id": pegasus_video_id,
+                "workflow": "pegasus_summarization"
+            }
+            
+        except Exception as e:
+            logger.error(f"Video summarization error: {e}")
+            return {"text": f"Summarization error: {str(e)}", "error": True}
+    
+    def _summarize_video_stream(self, prompt: str, chunks: List[ChunkInfo]) -> dict:
+        """Execute streaming video summarization using Twelve Labs Pegasus model."""
+        try:
+            logger.info(f"Starting streaming video summarization for {len(chunks)} chunks")
+            
+            # Get the video file info same as non-streaming
+            if not chunks or len(chunks) == 0:
+                yield {"choices": [{"message": {"content": "No video chunks provided for summarization"}}]}
+                return
+            
+            chunk = chunks[0]
+            video_file_path = chunk.file if hasattr(chunk, 'file') else None
+            
+            if not video_file_path:
+                yield {"choices": [{"message": {"content": "Unable to determine video file path from chunks"}}]}
+                return
+            
+            # Extract VSS file ID from path
+            import re
+            path_parts = str(video_file_path).split('/')
+            vss_file_id = None
+            for part in path_parts:
+                if re.match(r'^[0-9a-f-]{36}$', part):  # UUID format
+                    vss_file_id = part
+                    break
+            
+            if not vss_file_id:
+                yield {"choices": [{"message": {"content": f"Unable to extract VSS file ID from path: {video_file_path}"}}]}
+                return
+            
+            logger.info(f"Streaming summarization for video with VSS ID: {vss_file_id}")
+            
+            # Ensure video is uploaded
+            upload_result = self.ensure_video_uploaded(vss_file_id)
+            if upload_result.get("error"):
+                yield {"choices": [{"message": {"content": upload_result["text"]}}]}
+                return
+            
+            pegasus_video_id = upload_result.get("pegasus_video_id")
+            if not pegasus_video_id:
+                yield {"choices": [{"message": {"content": "Failed to get Pegasus video ID for summarization"}}]}
+                return
+            
+            # Use Pegasus summarization (Twelve Labs may not have streaming summarize)
+            logger.info(f"Streaming Pegasus summarization for video {pegasus_video_id}")
+            try:
+                # Try streaming summarize if available
+                if hasattr(self._client, 'summarize_stream'):
+                    for chunk in self._client.summarize_stream(
+                        video_id=pegasus_video_id,
+                        prompt=prompt,
+                        temperature=self._config.analysis_temperature,
+                        type="summary"
+                    ):
+                        if hasattr(chunk, 'summary') and chunk.summary:
+                            yield {"choices": [{"delta": {"content": chunk.summary}}]}
+                        elif hasattr(chunk, 'text') and chunk.text:
+                            yield {"choices": [{"delta": {"content": chunk.text}}]}
+                else:
+                    # Fallback to non-streaming summarize
+                    response = self._client.summarize(
+                        video_id=pegasus_video_id,
+                        prompt=prompt,
+                        temperature=self._config.analysis_temperature,
+                        type="summary"
+                    )
+                    
+                    if response.summary is not None:
+                        yield {"choices": [{"message": {"content": response.summary}}]}
+                    else:
+                        yield {"choices": [{"message": {"content": f"Unable to generate summary for video {vss_file_id}"}}]}
                 
-                # Clean the prompt by removing the parameter section
-                prompt = re.sub(r'\s*\[ANALYZE:.*?\]', '', prompt).strip()
+                # Send completion marker
+                yield {"choices": [{"delta": {"content": ""}, "finish_reason": "stop"}]}
+                
+            except Exception as stream_error:
+                logger.warning(f"Streaming failed, falling back to regular summarize: {stream_error}")
+                # Fallback to non-streaming
+                response = self._client.summarize(
+                    video_id=pegasus_video_id,
+                    prompt=prompt,
+                    temperature=self._config.analysis_temperature,
+                    type="summary"
+                )
+                
+                if response.summary is not None:
+                    yield {"choices": [{"message": {"content": response.summary}}]}
+                else:
+                    yield {"choices": [{"message": {"content": f"Unable to generate summary for video {vss_file_id}"}}]}
+                    
+        except Exception as e:
+            logger.error(f"Streaming video summarization error: {e}")
+            yield {"choices": [{"message": {"content": f"Summarization error: {str(e)}"}}]}
+    
+    def search(self, query: str, analyze: bool = False, stream: bool = False, max_clips: int = None, threshold: str = None):
+        """Execute search across all videos using Twelve Labs Marengo model."""
+        if self._client is None:
+            return {"text": "Client not available"}
         
-        # Update config with search parameters
-        if max_clips != self._config.max_clips:
+        logger.info(f"Starting Twelve Labs search: query='{query}', analyze={analyze}, stream={stream}")
+        
+        # Set search parameters
+        if max_clips is not None:
             self._config.max_clips = max_clips
-        if threshold != self._config.search_threshold:
+        if threshold is not None:
             self._config.search_threshold = threshold
         
-        if analyze_mode or not "[ANALYZE:" in str(generation_config):
-            # Use search and analyze workflow
-            if stream:
-                return self._search_and_analyze_stream(prompt)
-            else:
-                result = self._search_and_analyze(prompt)
-                return {"text": result["text"]}
+        if stream:
+            return self._search_stream(query)
         else:
-            # For pure search (no analysis), return search results only
-            result = self._search_only(prompt)
+            result = self._search_only(query)
             return {"text": result["text"]}
+    
+    def _search_stream(self, query: str):
+        """Execute streaming search across all videos."""
+        for chunk in self._search_only_stream(query):
+            yield chunk
     
     def _search_only(self, prompt: str) -> dict:
         """Execute search-only workflow: return clips without analysis."""
@@ -129,7 +290,11 @@ class TwelveLabsModel(CustomModelBase):
             
             for i, clip in enumerate(relevant_clips[:10]):  # Show top 10 clips
                 video_title = clip.get('video_title', f"Video {clip['video_id'][:8]}")
+                vss_file_id = clip.get('vss_file_id', 'Unknown')
+                twelve_labs_video_id = clip.get('video_id', 'Unknown')
                 search_results += f"{i+1}. {video_title}\n"
+                search_results += f"   VSS Video ID: {vss_file_id}\n"
+                search_results += f"   Twelve Labs Video ID: {twelve_labs_video_id}\n"
                 search_results += f"   Time: {clip['start']:.1f}s - {clip['end']:.1f}s\n"
                 search_results += f"   Score: {clip['score']:.2f}\n"
                 search_results += f"   Confidence: {clip['confidence']}\n\n"
@@ -144,78 +309,7 @@ class TwelveLabsModel(CustomModelBase):
             logger.error(f"Twelve Labs search error: {e}")
             return {"text": f"Search error: {str(e)}", "error": True}
     
-    def _search_and_analyze(self, prompt: str) -> dict:
-        """Execute the search workflow: Marengo search → Pegasus analysis.
-        
-        Searches across ALL videos that have already been uploaded to Twelve Labs.
-        Uses multiple clips for richer analysis.
-        
-        Args:
-            prompt: User search prompt
-            
-        Returns:
-            Final analysis result from matching clips across all videos
-        """
-        try:
-            logger.info(f"Starting search workflow: Marengo search → Pegasus analysis")
-            
-            marengo_index_id = self._get_marengo_index_id()
-            pegasus_index_id = self._get_pegasus_index_id()
-            
-            logger.info("Searching across all previously uploaded videos")
-            relevant_clips = self._marengo_search_all(prompt, marengo_index_id)
-            if not relevant_clips or len(relevant_clips) == 0:
-                logger.warning("No relevant clips found")
-                return {
-                    "text": f"No relevant clips found for query: {prompt}",
-                    "workflow": "marengo_search_no_results"
-                }
-            
-            logger.info("Generating analysis from found clips")
-            analysis = self._pegasus_analyze_clips(prompt, relevant_clips, pegasus_index_id)
-            
-            return {
-                "text": analysis,
-                "clips_found": len(relevant_clips),
-                "workflow": "marengo_search_pegasus_analysis"
-            }
-            
-        except Exception as e:
-            logger.error(f"Twelve Labs search error: {e}")
-            return {"text": f"Search error: {str(e)}", "error": True}
     
-    def _search_and_analyze_stream(self, prompt: str) -> Generator[dict, None, None]:
-        """Execute the search workflow with streaming response.
-        
-        Args:
-            prompt: User search prompt
-            
-        Yields:
-            Streaming response chunks in VSS format
-        """
-        try:
-            logger.info(f"Starting streaming search workflow")
-            
-            marengo_index_id = self._get_marengo_index_id()
-            pegasus_index_id = self._get_pegasus_index_id()
-            
-            # Yield initial status
-            yield {"choices": [{"delta": {"content": "Searching across all videos...\n"}}]}
-            
-            relevant_clips = self._marengo_search_all(prompt, marengo_index_id)
-            if not relevant_clips or len(relevant_clips) == 0:
-                yield {"choices": [{"message": {"content": f"No relevant clips found for query: {prompt}"}}]}
-                return
-            
-            yield {"choices": [{"delta": {"content": f"Found {len(relevant_clips)} relevant clips. Analyzing...\n"}}]}
-            
-            # Stream the analysis
-            for chunk in self._pegasus_analyze_clips_stream(prompt, relevant_clips, pegasus_index_id):
-                yield chunk
-                
-        except Exception as e:
-            logger.error(f"Twelve Labs streaming search error: {e}")
-            yield {"choices": [{"message": {"content": f"Search error: {str(e)}"}}]}
     
     def _get_marengo_index_id(self):
         def create_index():
@@ -348,24 +442,32 @@ class TwelveLabsModel(CustomModelBase):
             clips = []
             if hasattr(search_results, 'data'):
                 for result in search_results.data:
+                    logger.info(f"Processing search result: video_id={result.video_id}")
+                    vss_file_id = VideoIDMapper.get_vss_id_for_marengo(result.video_id)
+                    logger.info(f"Found VSS file ID: {vss_file_id} for Marengo video ID: {result.video_id}")
                     clips.append({
                         "start": result.start,
                         "end": result.end,
                         "score": result.score,
                         "confidence": result.confidence,
                         "video_id": result.video_id,
-                        "video_title": getattr(result, 'video_title', 'Unknown')
+                        "video_title": getattr(result, 'video_title', 'Unknown'),
+                        "vss_file_id": vss_file_id or 'Unknown'
                     })
             else:
                 for page in search_results:
                     for result in page:
+                        logger.info(f"Processing search result: video_id={result.video_id}")
+                        vss_file_id = VideoIDMapper.get_vss_id_for_marengo(result.video_id)
+                        logger.info(f"Found VSS file ID: {vss_file_id} for Marengo video ID: {result.video_id}")
                         clips.append({
                             "start": result.start,
                             "end": result.end,
                             "score": result.score,
                             "confidence": result.confidence,
                             "video_id": result.video_id,
-                            "video_title": getattr(result, 'video_title', 'Unknown')
+                            "video_title": getattr(result, 'video_title', 'Unknown'),
+                            "vss_file_id": vss_file_id or 'Unknown'
                         })
             
             logger.info(f"Marengo found {len(clips)} relevant clips across all videos")
@@ -398,9 +500,13 @@ class TwelveLabsModel(CustomModelBase):
                         'end': clip['end'],
                         'score': clip['score']
                     })
+                else:
+                    logger.warning(f"Could not find Pegasus video ID for Marengo video ID {clip['video_id']}")
             
             if not clips_context:
-                return "Could not generate analysis - video mapping not found"
+                error_msg = f"Could not generate analysis - no video mappings found for {len(top_clips)} clips"
+                logger.error(error_msg)
+                return error_msg
             
             # Use the best clip's video for analysis, but include context from others
             primary_video_id = clips_context[0]['video_id']
@@ -458,9 +564,13 @@ Relevant video segments found:
                         'end': clip['end'],
                         'score': clip['score']
                     })
+                else:
+                    logger.warning(f"Could not find Pegasus video ID for Marengo video ID {clip['video_id']}")
             
             if not clips_context:
-                yield {"choices": [{"message": {"content": "Could not generate analysis - video mapping not found"}}]}
+                error_msg = f"Could not generate analysis - no video mappings found for {len(top_clips)} clips"
+                logger.error(error_msg)
+                yield {"choices": [{"message": {"content": error_msg}}]}
                 return
             
             # Use the best clip's video for analysis

@@ -18,6 +18,7 @@ from via_stream_handler import (  # isort:skip
     RequestInfo,
     ViaStreamHandler,
 )
+from search_handler import SearchHandler, SearchRequestInfo  # isort:skip
 
 import argparse
 import asyncio
@@ -1445,6 +1446,8 @@ class ViaServer:
         try:
             # Start the VIA stream handler
             self._stream_handler = ViaStreamHandler(self._args)
+            # Initialize the search handler
+            self._search_handler = SearchHandler()
         except Exception as ex:
             raise ViaException(f"Failed to load VIA stream handler - {str(ex)}")
 
@@ -2662,69 +2665,23 @@ class ViaServer:
                     422,
                 )
             
-            # Create a dummy asset list for compatibility with the Twelve Labs model
-            # The model doesn't need actual assets since it searches across all uploaded videos
-            dummy_asset = Asset(
-                asset_id=str(uuid.uuid4()),
-                filename="search_dummy",
-                size=0,
-                media_type="video",
-                is_live=False
-            )
-            assetList = [dummy_asset]
-            
             # Get model info
-            model_info = ModelInfoDict(id=query.model, type="custom", task="search")
-            
-            # Configure LLM generation parameters
-            llm_generation_config = {}
-            if query.temperature is not None:
-                llm_generation_config["temperature"] = query.temperature
-            
-            # Create search prompt with additional parameters
-            search_prompt = query.query
-            if query.analyze:
-                search_prompt += f" [ANALYZE: true, MAX_CLIPS: {query.max_clips}, THRESHOLD: {query.threshold}]"
+            model_info = self._stream_handler.get_models_info()
             
             loop = asyncio.get_event_loop()
             
             try:
-                # Use the standard summarize method but with search parameters
+                # Use the dedicated search handler
                 request_id = await loop.run_in_executor(
                     self._async_executor,
-                    self._stream_handler.summarize,
-                    assetList,
-                    search_prompt,  # Use the search query as prompt
-                    0,  # chunk_duration - not relevant for search
-                    0,  # chunk_overlap_duration - not relevant
-                    llm_generation_config,
-                    0.0,  # media_info_start
-                    -1.0,  # media_info_end  
-                    "",  # caption_summarization_prompt
-                    "",  # summary_aggregation_prompt
-                    False,  # summarize
-                    True,  # enable_chat (for search interaction)
-                    False,  # enable_chat_history
-                    False,  # enable_cv_metadata
-                    "",  # graph_rag_prompt_yaml
-                    0,  # num_frames_per_chunk
-                    1,  # summarize_batch_size
-                    None,  # rag_type
-                    5,  # rag_top_k
-                    1,  # rag_batch_size
-                    0,  # vlm_input_width
-                    0,  # vlm_input_height
-                    False,  # enable_audio
-                    1.0,  # summarize_top_p
-                    0.7,  # summarize_temperature
-                    1024,  # summarize_max_tokens
-                    1.0,  # chat_top_p
-                    query.temperature,  # chat_temperature
-                    1024,  # chat_max_tokens
-                    1.0,  # notification_top_p
-                    0.7,  # notification_temperature
-                    512,  # notification_max_tokens
-                    "",  # cv_pipeline_prompt
+                    self._search_handler.search,
+                    query.query,
+                    query.model,
+                    query.analyze,
+                    query.stream,
+                    query.max_clips,
+                    query.threshold,
+                    query.temperature or 0.7
                 )
                 
                 logger.info("Created search request %s", request_id)
@@ -2733,56 +2690,33 @@ class ViaServer:
                     # Server side events generator for streaming response
                     async def message_generator():
                         try:
-                            while True:
-                                req_info, resp_list = self._stream_handler.get_response(request_id, 1)
-                                
-                                if not resp_list:
-                                    if req_info.status in [
-                                        RequestInfo.Status.SUCCESSFUL,
-                                        RequestInfo.Status.FAILED,
-                                    ]:
-                                        self._stream_handler.check_status_remove_req_id(request_id)
-                                        break
-                                    await asyncio.sleep(0.5)
-                                    continue
-                                
-                                # Process response from the twelve-labs model
-                                for response in resp_list:
+                            for chunk in self._search_handler.get_search_stream_response(request_id):
+                                if "choices" in chunk:
                                     response_dict = {
                                         "id": request_id,
                                         "model": model_info.id,
-                                        "created": int(req_info.queue_time),
+                                        "created": int(time.time()),
                                         "object": "search.chunk",
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {
-                                                    "content": response.get("text", ""),
-                                                    "role": "assistant"
-                                                },
-                                                "finish_reason": None,
-                                            }
-                                        ],
+                                        "choices": chunk["choices"]
                                     }
                                     yield f"data: {json.dumps(response_dict)}\n\n"
-                                
-                                if req_info.status == RequestInfo.Status.SUCCESSFUL:
-                                    final_response = {
-                                        "id": request_id,
-                                        "model": model_info.id,
-                                        "created": int(req_info.queue_time),
-                                        "object": "search.chunk",
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {},
-                                                "finish_reason": "stop",
-                                            }
-                                        ],
+                            
+                            # Send final completion message
+                            final_response = {
+                                "id": request_id,
+                                "model": model_info.id,
+                                "created": int(time.time()),
+                                "object": "search.chunk",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "stop",
                                     }
-                                    yield f"data: {json.dumps(final_response)}\n\n"
-                                    self._stream_handler.check_status_remove_req_id(request_id)
-                                    break
+                                ],
+                            }
+                            yield f"data: {json.dumps(final_response)}\n\n"
+                            self._search_handler.check_status_remove_req_id(request_id)
                                     
                         except Exception as e:
                             logger.error(f"Search streaming error: {e}")
@@ -2803,7 +2737,7 @@ class ViaServer:
                                 ],
                             }
                             yield f"data: {json.dumps(error_response)}\n\n"
-                            self._stream_handler.check_status_remove_req_id(request_id)
+                            self._search_handler.check_status_remove_req_id(request_id)
                             
                         yield "data: [DONE]\n\n"
                     
@@ -2811,21 +2745,24 @@ class ViaServer:
                 
                 else:
                     # Non-streaming output. Wait for request to be completed.
-                    await self._stream_handler.wait_for_request_done(request_id)
-                    req_info, resp_list = self._stream_handler.get_response(request_id)
-                    self._stream_handler.check_status_remove_req_id(request_id)
+                    success = await self._search_handler.wait_for_search_done(request_id)
+                    search_info, resp_list = self._search_handler.get_search_response(request_id)
+                    self._search_handler.check_status_remove_req_id(request_id)
+                    
+                    if not success or not search_info:
+                        raise ViaException("Search request failed or timed out", "SearchError", 500)
                     
                     # Combine all responses
                     search_results = ""
                     for response in resp_list:
-                        search_results += response.get("text", "")
+                        search_results += response.response
                     
                     # Create response JSON
                     response = {
                         "id": request_id,
                         "model": model_info.id,
-                        "created": int(req_info.queue_time),
-                        "object": "search.completion",
+                        "created": int(search_info.queue_time),
+                        "object": "chat.completion",
                         "choices": [
                             {
                                 "finish_reason": CompletionFinishReason.STOP.value,
@@ -2837,8 +2774,13 @@ class ViaServer:
                             }
                         ],
                         "usage": {
-                            "total_chunks_processed": req_info.total_chunks_processed,
-                            "query_processing_time": int(req_info.query_processing_time),
+                            "total_chunks_processed": 0,  # Not applicable for search
+                            "query_processing_time": int(search_info.processing_time * 1000),
+                        },
+                        "media_info": {
+                            "type": "offset",
+                            "start_offset": 0,
+                            "end_offset": 0,
                         },
                     }
                     return response

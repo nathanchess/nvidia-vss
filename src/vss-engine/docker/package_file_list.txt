@@ -229,6 +229,7 @@ via_demo_client.py
 via_exception.py
 via_health_eval.py
 via_logger.py
+search_handler.py
 via_server.py
 via_stream_handler.py
 vlm_pipeline/__init__.py
