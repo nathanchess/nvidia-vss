@@ -106,6 +106,8 @@ class TwelveLabsContext:
         try:
             responses = []
             stats = []
+            
+            # Process each chunk using the standard workflow
             for chunk_info in chunk:
                 response = self._process_chunk_unified(prompt, chunk_info, generation_config)
                 responses.append(response)
@@ -140,7 +142,7 @@ class TwelveLabsContext:
             else:
                 generation_config.prompt = prompt
             
-            result = self._model.generate(
+            result = self._model.generate_chunks(
                 chunks=[chunk_info],
                 frames=None,
                 frame_times=None,

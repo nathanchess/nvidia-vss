@@ -51,10 +51,32 @@ class TwelveLabsModel(CustomModelBase):
             logger.error(f"Failed to initialize client: {e}")
             self._client = None
     
-    def generate(self, chunks: List[ChunkInfo], frames: torch.Tensor, frame_times: List[float], 
-                 generation_config: VlmGenerationConfig = None, **kwargs) -> dict:
-        """Generate video summarization using Twelve Labs Pegasus model ONLY."""
-        logger.info(f"TwelveLabsModel.generate() called with {len(chunks) if chunks else 0} chunks")
+    def generate(self, prompt: str, input_tensors: List[torch.Tensor], 
+                 video_frames_times: List[List], generation_config: VlmGenerationConfig) -> List:
+        """Generate video summarization using Twelve Labs Pegasus model."""
+        logger.info(f"TwelveLabsModel.generate() called with prompt: {prompt[:50]}...")
+        
+        if self._client is None:
+            return ["Client not available"]
+        
+        if not prompt:
+            return ["No prompt provided"]
+            
+        # Note: TwelveLabs operates differently from other models as it works with 
+        # uploaded videos rather than processing tensors directly. The actual video
+        # processing is handled through the TwelveLabsContext which provides the 
+        # necessary chunk information via the legacy generate_chunks() method.
+        
+        # This method maintains interface compatibility but delegates to chunk-based processing
+        logger.warning("TwelveLabsModel.generate() called via standard interface - this should normally go through TwelveLabsContext")
+        
+        # Return a basic response indicating this should be called through the context
+        return [f"TwelveLabs model requires video chunk information for summarization of: {prompt}"]
+    
+    def generate_chunks(self, chunks: List[ChunkInfo], frames: torch.Tensor, frame_times: List[float], 
+                       generation_config=None, **kwargs) -> dict:
+        """Generate video summarization using Twelve Labs Pegasus model (legacy interface)."""
+        logger.info(f"TwelveLabsModel.generate_chunks() called with {len(chunks) if chunks else 0} chunks")
         
         if self._client is None:
             return {"text": "Client not available"}
@@ -69,10 +91,39 @@ class TwelveLabsModel(CustomModelBase):
         if not prompt:
             return {"text": "No prompt provided"}
         
-        # This method is ONLY for summarization - NEVER do search
+        # Handle video summarization with chunks
         if not chunks or len(chunks) == 0:
-            logger.error("generate() method called without chunks - this should ONLY be used for summarization")
-            return {"text": "ERROR: generate() method requires video chunks for summarization. Use search() method for search queries.", "error": True}
+            logger.warning("No chunks provided for summarization")
+            return {"text": f"No video content available for summarization of: {prompt}"}
+        
+        logger.info(f"TwelveLabsModel.generate_chunks() - received {len(chunks)} chunks")
+        if len(chunks) > 0 and chunks[0].file:
+            logger.info(f"First chunk file path: {chunks[0].file}")
+        
+        # Check if this is a multi-video request via video_ids in generation_config
+        video_ids_from_config = None
+        if isinstance(generation_config, dict) and "video_ids" in generation_config:
+            video_ids_from_config = generation_config["video_ids"]
+        elif generation_config and hasattr(generation_config, "video_ids"):
+            video_ids_from_config = generation_config.video_ids
+        
+        if video_ids_from_config and len(video_ids_from_config) > 1:
+            logger.info(f"Detected multi-video request from generation_config: {len(video_ids_from_config)} videos - IDs: {video_ids_from_config}")
+            if stream:
+                return self._summarize_multiple_videos_stream(prompt, video_ids_from_config)
+            else:
+                result = self._summarize_multiple_videos_concatenated(prompt, video_ids_from_config)
+                return {"text": result["text"]}
+        
+        # Check if this is a multi-video request via video_ids in kwargs (legacy support)
+        video_ids = kwargs.get('video_ids', None)
+        if video_ids and isinstance(video_ids, list) and len(video_ids) > 1:
+            logger.info(f"Multi-video summarization requested for {len(video_ids)} videos")
+            if stream:
+                return self._summarize_multiple_videos_stream(prompt, video_ids)
+            else:
+                result = self._summarize_multiple_videos_concatenated(prompt, video_ids)
+                return {"text": result["text"]}
         
         logger.info(f"Starting Pegasus video summarization for {len(chunks)} chunks")
         if stream:
@@ -244,6 +295,199 @@ class TwelveLabsModel(CustomModelBase):
         except Exception as e:
             logger.error(f"Streaming video summarization error: {e}")
             yield {"choices": [{"message": {"content": f"Summarization error: {str(e)}"}}]}
+    
+    def _summarize_multiple_videos_concatenated(self, prompt: str, video_ids: List[str]) -> dict:
+        """Execute video summarization for multiple videos and concatenate results."""
+        try:
+            logger.info(f"Starting concatenated multi-video summarization for {len(video_ids)} videos")
+            
+            individual_summaries = []
+            successful_count = 0
+            failed_count = 0
+            
+            for i, vss_file_id in enumerate(video_ids):
+                logger.info(f"Processing video {i+1}/{len(video_ids)}: {vss_file_id}")
+                
+                try:
+                    # Ensure the video is uploaded to Twelve Labs
+                    upload_result = self.ensure_video_uploaded(vss_file_id)
+                    if upload_result.get("error"):
+                        logger.warning(f"Failed to upload video {vss_file_id}: {upload_result.get('text')}")
+                        individual_summaries.append({
+                            "video_number": i + 1,
+                            "vss_file_id": vss_file_id,
+                            "status": "error",
+                            "content": f"❌ Upload failed: {upload_result.get('text', 'Unknown error')}"
+                        })
+                        failed_count += 1
+                        continue
+                    
+                    pegasus_video_id = upload_result.get("pegasus_video_id")
+                    if not pegasus_video_id:
+                        error_msg = f"Failed to get Pegasus video ID for {vss_file_id}"
+                        logger.warning(error_msg)
+                        individual_summaries.append({
+                            "video_number": i + 1,
+                            "vss_file_id": vss_file_id,
+                            "status": "error",
+                            "content": f"❌ {error_msg}"
+                        })
+                        failed_count += 1
+                        continue
+                    
+                    # Perform summarization for this video
+                    logger.info(f"Summarizing video {pegasus_video_id} (VSS ID: {vss_file_id})")
+                    response = self._client.summarize(
+                        video_id=pegasus_video_id,
+                        prompt=prompt,
+                        temperature=self._config.analysis_temperature,
+                        type="summary"
+                    )
+                    
+                    if response.summary is not None:
+                        individual_summaries.append({
+                            "video_number": i + 1,
+                            "vss_file_id": vss_file_id,
+                            "status": "success",
+                            "content": response.summary
+                        })
+                        successful_count += 1
+                        logger.info(f"Successfully summarized video {i+1}/{len(video_ids)}")
+                    else:
+                        error_msg = f"No summary returned for video {vss_file_id}"
+                        logger.warning(error_msg)
+                        individual_summaries.append({
+                            "video_number": i + 1,
+                            "vss_file_id": vss_file_id,
+                            "status": "error",
+                            "content": f"❌ {error_msg}"
+                        })
+                        failed_count += 1
+                
+                except Exception as video_error:
+                    logger.error(f"Error summarizing video {vss_file_id}: {video_error}")
+                    individual_summaries.append({
+                        "video_number": i + 1,
+                        "vss_file_id": vss_file_id,
+                        "status": "error",
+                        "content": f"❌ Processing error: {str(video_error)}"
+                    })
+                    failed_count += 1
+            
+            # Format the concatenated results
+            formatted_result = self._format_concatenated_summaries(prompt, individual_summaries, successful_count, failed_count)
+            
+            return {
+                "text": formatted_result,
+                "successful_count": successful_count,
+                "failed_count": failed_count,
+                "total_count": len(video_ids),
+                "workflow": "concatenated_multi_video_summarization"
+            }
+            
+        except Exception as e:
+            logger.error(f"Multi-video summarization error: {e}")
+            return {"text": f"Multi-video summarization error: {str(e)}", "error": True}
+    
+    def _summarize_multiple_videos_stream(self, prompt: str, video_ids: List[str]):
+        """Execute streaming video summarization for multiple videos with concatenation."""
+        try:
+            logger.info(f"Starting streaming concatenated multi-video summarization for {len(video_ids)} videos")
+            
+            # Start with overview
+            yield {"choices": [{"delta": {"content": f"Multi-Video Summary\n"}}]}
+            yield {"choices": [{"delta": {"content": f"Processing {len(video_ids)} videos...\n\n"}}]}
+            
+            successful_count = 0
+            failed_count = 0
+            
+            for i, vss_file_id in enumerate(video_ids):
+                yield {"choices": [{"delta": {"content": f"Video {i+1}:\n"}}]}
+                
+                try:
+                    # Ensure the video is uploaded to Twelve Labs
+                    upload_result = self.ensure_video_uploaded(vss_file_id)
+                    if upload_result.get("error"):
+                        error_msg = f"❌ Upload failed: {upload_result.get('text', 'Unknown error')}\n\n"
+                        yield {"choices": [{"delta": {"content": error_msg}}]}
+                        failed_count += 1
+                        continue
+                    
+                    pegasus_video_id = upload_result.get("pegasus_video_id")
+                    if not pegasus_video_id:
+                        error_msg = f"❌ Failed to get Pegasus video ID\n\n"
+                        yield {"choices": [{"delta": {"content": error_msg}}]}
+                        failed_count += 1
+                        continue
+                    
+                    # Perform summarization for this video
+                    response = self._client.summarize(
+                        video_id=pegasus_video_id,
+                        prompt=prompt,
+                        temperature=self._config.analysis_temperature,
+                        type="summary"
+                    )
+                    
+                    if response.summary is not None:
+                        yield {"choices": [{"delta": {"content": response.summary}}]}
+                        yield {"choices": [{"delta": {"content": "\n\n"}}]}
+                        successful_count += 1
+                    else:
+                        yield {"choices": [{"delta": {"content": f"❌ No summary generated\n\n"}}]}
+                        failed_count += 1
+                
+                except Exception as video_error:
+                    logger.error(f"Error processing video {vss_file_id}: {video_error}")
+                    error_msg = f"❌ Processing error: {str(video_error)}\n\n"
+                    yield {"choices": [{"delta": {"content": error_msg}}]}
+                    failed_count += 1
+            
+            # Summary footer
+            summary_footer = f"---\nProcessed {successful_count + failed_count} videos"
+            if successful_count > 0:
+                summary_footer += f" ({successful_count} successful"
+                if failed_count > 0:
+                    summary_footer += f", {failed_count} failed"
+                summary_footer += ")"
+            elif failed_count > 0:
+                summary_footer += f" (all {failed_count} failed)"
+            summary_footer += "\n"
+            
+            yield {"choices": [{"delta": {"content": summary_footer}}]}
+            yield {"choices": [{"delta": {"content": ""}, "finish_reason": "stop"}]}
+            
+        except Exception as e:
+            logger.error(f"Streaming multi-video summarization error: {e}")
+            yield {"choices": [{"message": {"content": f"Multi-video summarization error: {str(e)}"}}]}
+    
+    def _format_concatenated_summaries(self, prompt: str, summaries: List[dict], successful_count: int, failed_count: int) -> str:
+        """Format individual video summaries into a concatenated response."""
+        result_lines = []
+        result_lines.append("Multi-Video Summary")
+        result_lines.append("=" * 50)
+        result_lines.append(f"Query: {prompt}")
+        result_lines.append(f"Processed: {successful_count + failed_count} videos ({successful_count} successful, {failed_count} failed)")
+        result_lines.append("")
+        
+        # Add individual video summaries
+        for summary_data in summaries:
+            video_num = summary_data["video_number"]
+            content = summary_data["content"]
+            
+            result_lines.append(f"Video {video_num}:")
+            result_lines.append("-" * 20)
+            result_lines.append(content)
+            result_lines.append("")
+        
+        if successful_count > 1:
+            result_lines.append("Combined Analysis:")
+            result_lines.append("-" * 20)
+            result_lines.append(f"Successfully processed {successful_count} videos. Each video was individually summarized based on the query: {prompt}")
+            result_lines.append("")
+        
+        result_lines.append("=" * 50)
+        
+        return "\n".join(result_lines)
     
     def search(self, query: str, analyze: bool = False, stream: bool = False, max_clips: int = None, threshold: str = None):
         """Execute search across all videos using Twelve Labs Marengo model."""

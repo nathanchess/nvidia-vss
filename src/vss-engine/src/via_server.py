@@ -1946,13 +1946,23 @@ class ViaServer:
                 for videoId in videoIdList:
                     asset = self._asset_manager.get_asset(videoId)
                     assetList.append(asset)
-                    if asset.media_type != "image":
-                        raise ViaException(
-                            "Multi-file summarize: Only image files supported."
-                            f" {asset._filename} is a not an image",
-                            "BadParameters",
-                            400,
-                        )
+                    # Allow videos for twelve-labs model, images for other models
+                    if query.model == "twelve-labs":
+                        if asset.media_type not in ["video", "image"]:
+                            raise ViaException(
+                                f"Multi-file summarize with twelve-labs: Only video and image files supported."
+                                f" {asset._filename} is not a video or image",
+                                "BadParameters",
+                                400,
+                            )
+                    else:
+                        if asset.media_type != "image":
+                            raise ViaException(
+                                "Multi-file summarize: Only image files supported."
+                                f" {asset._filename} is a not an image",
+                                "BadParameters",
+                                400,
+                            )
 
             if query.enable_audio:
                 for videoId in videoIdList:
