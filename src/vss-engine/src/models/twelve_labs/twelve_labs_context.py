@@ -10,7 +10,7 @@
 # its affiliates is strictly prohibited.
 ######################################################################################################
 
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Generator
 
 import torch
 
@@ -149,7 +149,33 @@ class TwelveLabsContext:
                 generation_config=generation_config,
             )
             
-            if isinstance(result, dict):
+            logger.info(f"Twelve Labs context got result type: {type(result)}")
+            
+            # Check if we got a generator (streaming mode)
+            if hasattr(result, '__next__') and hasattr(result, '__iter__'):
+                # This is a generator - consume it and collect the content
+                logger.info("Detected streaming generator, consuming responses")
+                collected_content = []
+                try:
+                    for chunk_response in result:
+                        if isinstance(chunk_response, dict) and "choices" in chunk_response:
+                            for choice in chunk_response["choices"]:
+                                if "delta" in choice and "content" in choice["delta"]:
+                                    collected_content.append(choice["delta"]["content"])
+                                elif "message" in choice and "content" in choice["message"]:
+                                    collected_content.append(choice["message"]["content"])
+                    
+                    # Return collected content as single string
+                    result_text = "".join(collected_content)
+                    logger.info(f"Collected {len(collected_content)} streaming chunks, total length: {len(result_text)}")
+                    return result_text
+                
+                except Exception as gen_error:
+                    logger.error(f"Error consuming streaming generator: {gen_error}")
+                    return f"Error consuming streaming response: {str(gen_error)}"
+            
+            # Non-streaming response - handle as before
+            elif isinstance(result, dict):
                 return result.get("text", "")
             else:
                 return str(result)

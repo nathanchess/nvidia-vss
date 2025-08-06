@@ -510,8 +510,26 @@ class TwelveLabsModel(CustomModelBase):
     
     def _search_stream(self, query: str):
         """Execute streaming search across all videos."""
-        for chunk in self._search_only_stream(query):
-            yield chunk
+        # Get the search results
+        result = self._search_only(query)
+        
+        # Convert to streaming format and yield
+        text = result.get("text", "")
+        if text:
+            yield {
+                "choices": [{
+                    "delta": {"content": text},
+                    "index": 0
+                }]
+            }
+        
+        # Send completion marker
+        yield {
+            "choices": [{
+                "delta": {"content": ""}, 
+                "finish_reason": "stop"
+            }]
+        }
     
     def _search_only(self, prompt: str) -> dict:
         """Execute search-only workflow: return clips without analysis."""

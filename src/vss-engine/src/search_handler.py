@@ -51,6 +51,9 @@ class SearchRequestInfo:
         self.model = ""
         self.analyze = False
         self.stream = False
+        self.max_clips = 10
+        self.threshold = "medium"
+        self.temperature = 0.7
         self.queue_time = time.time()
         self.start_time = None
         self.end_time = None
@@ -113,6 +116,9 @@ class SearchHandler:
         search_info.model = model
         search_info.analyze = analyze
         search_info.stream = stream
+        search_info.max_clips = max_clips
+        search_info.threshold = threshold
+        search_info.temperature = temperature
         search_info.start_time = time.time()
         
         # Store request
@@ -230,11 +236,11 @@ class SearchHandler:
             
             # Use the dedicated search method with streaming
             stream_generator = self._twelve_labs_model.search(
-                query=query,
-                analyze=analyze, 
+                query=search_info.query,
+                analyze=search_info.analyze, 
                 stream=True,
-                max_clips=max_clips,
-                threshold=threshold
+                max_clips=search_info.max_clips,
+                threshold=search_info.threshold
             )
             for chunk in stream_generator:
                 yield chunk
