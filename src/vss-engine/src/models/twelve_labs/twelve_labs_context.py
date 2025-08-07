@@ -139,6 +139,22 @@ class TwelveLabsContext:
             
             if isinstance(generation_config, dict):
                 generation_config["prompt"] = prompt
+                # Check for multi-video by examining the chunk file path
+                if hasattr(chunk_info, 'file') and chunk_info.file and ';' in chunk_info.file:
+                    # This is a multi-video request with semicolon-separated paths
+                    logger.info(f"Detected multi-video request in TwelveLabsContext: {chunk_info.file}")
+                    # Extract video IDs from the semicolon-separated paths
+                    import re
+                    paths = chunk_info.file.split(';')
+                    video_ids = []
+                    for path in paths:
+                        # Extract UUID from path like ./assets/{uuid}/filename.mp4
+                        match = re.search(r'/([0-9a-f-]{36})/', path)
+                        if match:
+                            video_ids.append(match.group(1))
+                    if video_ids:
+                        generation_config["video_ids"] = video_ids
+                        logger.info(f"Added video_ids to generation_config: {video_ids}")
             else:
                 generation_config.prompt = prompt
             
@@ -149,33 +165,7 @@ class TwelveLabsContext:
                 generation_config=generation_config,
             )
             
-            logger.info(f"Twelve Labs context got result type: {type(result)}")
-            
-            # Check if we got a generator (streaming mode)
-            if hasattr(result, '__next__') and hasattr(result, '__iter__'):
-                # This is a generator - consume it and collect the content
-                logger.info("Detected streaming generator, consuming responses")
-                collected_content = []
-                try:
-                    for chunk_response in result:
-                        if isinstance(chunk_response, dict) and "choices" in chunk_response:
-                            for choice in chunk_response["choices"]:
-                                if "delta" in choice and "content" in choice["delta"]:
-                                    collected_content.append(choice["delta"]["content"])
-                                elif "message" in choice and "content" in choice["message"]:
-                                    collected_content.append(choice["message"]["content"])
-                    
-                    # Return collected content as single string
-                    result_text = "".join(collected_content)
-                    logger.info(f"Collected {len(collected_content)} streaming chunks, total length: {len(result_text)}")
-                    return result_text
-                
-                except Exception as gen_error:
-                    logger.error(f"Error consuming streaming generator: {gen_error}")
-                    return f"Error consuming streaming response: {str(gen_error)}"
-            
-            # Non-streaming response - handle as before
-            elif isinstance(result, dict):
+            if isinstance(result, dict):
                 return result.get("text", "")
             else:
                 return str(result)

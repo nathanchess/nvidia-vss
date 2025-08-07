@@ -20,7 +20,7 @@ import torch
 from base_class import CustomModelBase, EmbeddingGeneratorBase, VlmGenerationConfig
 from chunk_info import ChunkInfo
 from via_logger import TimeMeasure, logger
-from .twelve_labs_common import VideoIDMapper, wait_for_task_completion, ensure_index_exists, TwelveLabsConfig, retry_with_exponential_backoff
+from .twelve_labs_common import VideoIDMapper, ensure_index_exists, TwelveLabsConfig, retry_with_exponential_backoff
 
 try:
     from twelvelabs import TwelveLabs
@@ -96,41 +96,90 @@ class TwelveLabsModel(CustomModelBase):
             logger.warning("No chunks provided for summarization")
             return {"text": f"No video content available for summarization of: {prompt}"}
         
-        logger.info(f"TwelveLabsModel.generate_chunks() - received {len(chunks)} chunks")
+        logger.info(f"🔥 GENERATE_CHUNKS: received {len(chunks)} chunks")
         if len(chunks) > 0 and chunks[0].file:
-            logger.info(f"First chunk file path: {chunks[0].file}")
+            logger.info(f"🔥 GENERATE_CHUNKS: First chunk file path: {chunks[0].file}")
+            # Check for semicolon-separated paths
+            if ';' in chunks[0].file:
+                logger.info(f"🔥 GENERATE_CHUNKS: DETECTED SEMICOLON-SEPARATED PATH: {chunks[0].file}")
+                semicolon_paths = chunks[0].file.split(';')
+                logger.info(f"🔥 GENERATE_CHUNKS: Split into {len(semicolon_paths)} paths: {semicolon_paths}")
         
         # Check if this is a multi-video request via video_ids in generation_config
+        logger.info(f"🔥 GENERATE_CHUNKS: generation_config type: {type(generation_config)}, content: {generation_config}")
         video_ids_from_config = None
         if isinstance(generation_config, dict) and "video_ids" in generation_config:
             video_ids_from_config = generation_config["video_ids"]
+            logger.info(f"🔥 GENERATE_CHUNKS: Found video_ids in dict generation_config: {video_ids_from_config}")
         elif generation_config and hasattr(generation_config, "video_ids"):
             video_ids_from_config = generation_config.video_ids
+            logger.info(f"🔥 GENERATE_CHUNKS: Found video_ids in object generation_config: {video_ids_from_config}")
+        
+        logger.info(f"🔥 GENERATE_CHUNKS: Final extracted video_ids from config: {video_ids_from_config}")
+        
+        # If no video_ids in generation_config, try to extract from semicolon-separated paths
+        if not video_ids_from_config and len(chunks) > 0 and chunks[0].file and ';' in chunks[0].file:
+            logger.info(f"🔥 GENERATE_CHUNKS: No video_ids in config, attempting to extract from semicolon-separated paths")
+            import re
+            semicolon_paths = chunks[0].file.split(';')
+            extracted_video_ids = []
+            
+            for path in semicolon_paths:
+                path_parts = str(path).split('/')
+                for part in path_parts:
+                    if re.match(r'^[0-9a-f-]{36}$', part):  # UUID format
+                        extracted_video_ids.append(part)
+                        logger.info(f"🔥 GENERATE_CHUNKS: Extracted video ID from path '{path}': {part}")
+                        break
+            
+            if len(extracted_video_ids) > 1:
+                video_ids_from_config = extracted_video_ids
+                logger.info(f"🔥 GENERATE_CHUNKS: Successfully extracted {len(extracted_video_ids)} video IDs: {video_ids_from_config}")
+            else:
+                logger.warning(f"🔥 GENERATE_CHUNKS: Could only extract {len(extracted_video_ids)} video IDs from paths, need at least 2 for multi-video")
+        
+        logger.info(f"🔥 GENERATE_CHUNKS: Final video_ids (after path extraction): {video_ids_from_config}")
         
         if video_ids_from_config and len(video_ids_from_config) > 1:
-            logger.info(f"Detected multi-video request from generation_config: {len(video_ids_from_config)} videos - IDs: {video_ids_from_config}")
+            logger.info(f"🔥 GENERATE_CHUNKS: MULTI-VIDEO DETECTED from generation_config: {len(video_ids_from_config)} videos - IDs: {video_ids_from_config}")
             if stream:
+                logger.info(f"🔥 GENERATE_CHUNKS: CALLING _summarize_multiple_videos_stream with prompt='{prompt}', video_ids={video_ids_from_config}")
                 return self._summarize_multiple_videos_stream(prompt, video_ids_from_config)
             else:
+                logger.info(f"🔥 GENERATE_CHUNKS: CALLING _summarize_multiple_videos_concatenated with prompt='{prompt}', video_ids={video_ids_from_config}")
                 result = self._summarize_multiple_videos_concatenated(prompt, video_ids_from_config)
-                return {"text": result["text"]}
+                if result.get("error"):
+                    logger.error(f"Multi-video concatenation failed: {result.get('text')}")
+                    return {"text": result.get("text", "Multi-video summarization failed")}
+                return {"text": result.get("text", "No summary generated")}
         
         # Check if this is a multi-video request via video_ids in kwargs (legacy support)
         video_ids = kwargs.get('video_ids', None)
+        logger.info(f"🔥 GENERATE_CHUNKS: Checking legacy video_ids in kwargs: {video_ids}")
         if video_ids and isinstance(video_ids, list) and len(video_ids) > 1:
-            logger.info(f"Multi-video summarization requested for {len(video_ids)} videos")
+            logger.info(f"🔥 GENERATE_CHUNKS: MULTI-VIDEO DETECTED from kwargs: {len(video_ids)} videos - IDs: {video_ids}")
             if stream:
+                logger.info(f"🔥 GENERATE_CHUNKS: CALLING _summarize_multiple_videos_stream (legacy) with prompt='{prompt}', video_ids={video_ids}")
                 return self._summarize_multiple_videos_stream(prompt, video_ids)
             else:
+                logger.info(f"🔥 GENERATE_CHUNKS: CALLING _summarize_multiple_videos_concatenated (legacy) with prompt='{prompt}', video_ids={video_ids}")
                 result = self._summarize_multiple_videos_concatenated(prompt, video_ids)
-                return {"text": result["text"]}
+                if result.get("error"):
+                    logger.error(f"Multi-video concatenation failed: {result.get('text')}")
+                    return {"text": result.get("text", "Multi-video summarization failed")}
+                return {"text": result.get("text", "No summary generated")}
         
-        logger.info(f"Starting Pegasus video summarization for {len(chunks)} chunks")
+        logger.info(f"🔥 GENERATE_CHUNKS: NO MULTI-VIDEO DETECTED, starting Pegasus single video summarization for {len(chunks)} chunks")
         if stream:
+            logger.info(f"🔥 GENERATE_CHUNKS: CALLING _summarize_video_stream with prompt='{prompt}', chunks={len(chunks)}")
             return self._summarize_video_stream(prompt, chunks)
         else:
+            logger.info(f"🔥 GENERATE_CHUNKS: CALLING _summarize_video with prompt='{prompt}', chunks={len(chunks)}")
             result = self._summarize_video(prompt, chunks)
-            return {"text": result["text"]}
+            if result.get("error"):
+                logger.error(f"Single video summarization failed: {result.get('text')}")
+                return {"text": result.get("text", "Video summarization failed")}
+            return {"text": result.get("text", "No summary generated")}
     
     def _summarize_video(self, prompt: str, chunks: List[ChunkInfo]) -> dict:
         """Execute video summarization using Twelve Labs Pegasus model."""
@@ -296,10 +345,50 @@ class TwelveLabsModel(CustomModelBase):
             logger.error(f"Streaming video summarization error: {e}")
             yield {"choices": [{"message": {"content": f"Summarization error: {str(e)}"}}]}
     
+    def _check_all_videos_ready(self, video_ids: List[str]) -> Dict:
+        """Pre-check to ensure all videos are uploaded and ready before summarization."""
+        logger.info(f"Pre-checking readiness of {len(video_ids)} videos: {video_ids}")
+        
+        failed_videos = []
+        ready_videos = []
+        
+        for i, vss_file_id in enumerate(video_ids):
+            logger.info(f"Checking video {i+1}/{len(video_ids)}: {vss_file_id}")
+            
+            # Check if video is uploaded and ready
+            upload_result = self.ensure_video_uploaded(vss_file_id)
+            if upload_result.get("error"):
+                failed_videos.append({
+                    "vss_file_id": vss_file_id,
+                    "position": i + 1,
+                    "error": upload_result.get("text")
+                })
+                logger.error(f"Video {i+1} ({vss_file_id}) is not ready: {upload_result.get('text')}")
+            else:
+                ready_videos.append(vss_file_id)
+                logger.info(f"Video {i+1} ({vss_file_id}) is ready")
+        
+        if failed_videos:
+            error_details = []
+            for failed in failed_videos:
+                error_details.append(f"Video {failed['position']} ({failed['vss_file_id']}): {failed['error']}")
+            
+            error_message = f"Cannot proceed with multi-video summarization. {len(failed_videos)}/{len(video_ids)} videos are not ready:\n" + "\n".join(error_details)
+            logger.error(error_message)
+            return {"error": True, "text": error_message, "failed_videos": failed_videos}
+        
+        logger.info(f"All {len(video_ids)} videos are ready for summarization")
+        return {"error": False, "ready_videos": ready_videos}
+
     def _summarize_multiple_videos_concatenated(self, prompt: str, video_ids: List[str]) -> dict:
         """Execute video summarization for multiple videos and concatenate results."""
         try:
             logger.info(f"Starting concatenated multi-video summarization for {len(video_ids)} videos")
+            
+            # Pre-check all videos are ready
+            readiness_check = self._check_all_videos_ready(video_ids)
+            if readiness_check.get("error"):
+                return readiness_check
             
             individual_summaries = []
             successful_count = 0
@@ -392,35 +481,68 @@ class TwelveLabsModel(CustomModelBase):
     def _summarize_multiple_videos_stream(self, prompt: str, video_ids: List[str]):
         """Execute streaming video summarization for multiple videos with concatenation."""
         try:
-            logger.info(f"Starting streaming concatenated multi-video summarization for {len(video_ids)} videos")
+            logger.info(f"🔥 STARTING MULTI-VIDEO STREAMING: {len(video_ids)} videos with prompt: '{prompt}'")
+            logger.info(f"🔥 MULTI-VIDEO VIDEO IDS: {video_ids}")
+            
+            # Pre-check all videos are ready
+            logger.info(f"🔥 MULTI-VIDEO: Running readiness pre-check...")
+            readiness_check = self._check_all_videos_ready(video_ids)
+            logger.info(f"🔥 MULTI-VIDEO: Readiness check result: {readiness_check}")
+            
+            if readiness_check.get("error"):
+                error_msg = f"❌ Multi-video readiness check failed:\n{readiness_check.get('text')}\n"
+                logger.error(f"🔥 MULTI-VIDEO: Readiness check failed, yielding error: {error_msg}")
+                yield {"choices": [{"delta": {"content": error_msg}}]}
+                return
+            
+            logger.info(f"🔥 MULTI-VIDEO: All videos ready, starting streaming...")
             
             # Start with overview
-            yield {"choices": [{"delta": {"content": f"Multi-Video Summary\n"}}]}
-            yield {"choices": [{"delta": {"content": f"Processing {len(video_ids)} videos...\n\n"}}]}
+            overview_msg = f"Multi-Video Summary\n"
+            logger.info(f"🔥 MULTI-VIDEO: Yielding overview: {overview_msg}")
+            yield {"choices": [{"delta": {"content": overview_msg}}]}
+            
+            processing_msg = f"Processing {len(video_ids)} videos...\n\n"
+            logger.info(f"🔥 MULTI-VIDEO: Yielding processing message: {processing_msg}")
+            yield {"choices": [{"delta": {"content": processing_msg}}]}
             
             successful_count = 0
             failed_count = 0
             
             for i, vss_file_id in enumerate(video_ids):
-                yield {"choices": [{"delta": {"content": f"Video {i+1}:\n"}}]}
+                logger.info(f"🔥 MULTI-VIDEO: Processing video {i+1}/{len(video_ids)}: {vss_file_id}")
+                
+                video_header = f"Video {i+1}:\n"
+                logger.info(f"🔥 MULTI-VIDEO: Yielding video header: {video_header}")
+                yield {"choices": [{"delta": {"content": video_header}}]}
                 
                 try:
                     # Ensure the video is uploaded to Twelve Labs
+                    logger.info(f"🔥 MULTI-VIDEO: Checking upload status for {vss_file_id}...")
                     upload_result = self.ensure_video_uploaded(vss_file_id)
+                    logger.info(f"🔥 MULTI-VIDEO: Upload result for {vss_file_id}: {upload_result}")
+                    
                     if upload_result.get("error"):
                         error_msg = f"❌ Upload failed: {upload_result.get('text', 'Unknown error')}\n\n"
+                        logger.error(f"🔥 MULTI-VIDEO: Upload failed for {vss_file_id}, yielding error: {error_msg}")
                         yield {"choices": [{"delta": {"content": error_msg}}]}
                         failed_count += 1
                         continue
                     
                     pegasus_video_id = upload_result.get("pegasus_video_id")
+                    logger.info(f"🔥 MULTI-VIDEO: Got Pegasus video ID for {vss_file_id}: {pegasus_video_id}")
+                    
                     if not pegasus_video_id:
                         error_msg = f"❌ Failed to get Pegasus video ID\n\n"
+                        logger.error(f"🔥 MULTI-VIDEO: No Pegasus video ID for {vss_file_id}, yielding error: {error_msg}")
                         yield {"choices": [{"delta": {"content": error_msg}}]}
                         failed_count += 1
                         continue
                     
                     # Perform summarization for this video
+                    logger.info(f"🔥 MULTI-VIDEO: Starting Twelve Labs API call for video {pegasus_video_id}...")
+                    logger.info(f"🔥 MULTI-VIDEO: API params - video_id: {pegasus_video_id}, prompt: '{prompt}', temp: {self._config.analysis_temperature}")
+                    
                     response = self._client.summarize(
                         video_id=pegasus_video_id,
                         prompt=prompt,
@@ -428,19 +550,28 @@ class TwelveLabsModel(CustomModelBase):
                         type="summary"
                     )
                     
+                    logger.info(f"🔥 MULTI-VIDEO: API response for {pegasus_video_id}: type={type(response)}, summary_length={len(response.summary) if response.summary else 0}")
+                    
                     if response.summary is not None:
+                        logger.info(f"🔥 MULTI-VIDEO: Got valid summary for {pegasus_video_id}, length: {len(response.summary)}")
+                        logger.info(f"🔥 MULTI-VIDEO: Yielding summary content...")
                         yield {"choices": [{"delta": {"content": response.summary}}]}
                         yield {"choices": [{"delta": {"content": "\n\n"}}]}
                         successful_count += 1
+                        logger.info(f"🔥 MULTI-VIDEO: Successfully processed video {i+1}, total successful: {successful_count}")
                     else:
+                        logger.error(f"🔥 MULTI-VIDEO: No summary in response for {pegasus_video_id}")
                         yield {"choices": [{"delta": {"content": f"❌ No summary generated\n\n"}}]}
                         failed_count += 1
                 
                 except Exception as video_error:
-                    logger.error(f"Error processing video {vss_file_id}: {video_error}")
+                    logger.error(f"🔥 MULTI-VIDEO: Exception processing video {vss_file_id}: {video_error}")
                     error_msg = f"❌ Processing error: {str(video_error)}\n\n"
+                    logger.error(f"🔥 MULTI-VIDEO: Yielding exception error: {error_msg}")
                     yield {"choices": [{"delta": {"content": error_msg}}]}
                     failed_count += 1
+            
+            logger.info(f"🔥 MULTI-VIDEO: Finished processing all videos - successful: {successful_count}, failed: {failed_count}")
             
             # Summary footer
             summary_footer = f"---\nProcessed {successful_count + failed_count} videos"
@@ -453,8 +584,13 @@ class TwelveLabsModel(CustomModelBase):
                 summary_footer += f" (all {failed_count} failed)"
             summary_footer += "\n"
             
+            logger.info(f"🔥 MULTI-VIDEO: Yielding summary footer: {summary_footer}")
             yield {"choices": [{"delta": {"content": summary_footer}}]}
+            
+            logger.info(f"🔥 MULTI-VIDEO: Yielding final stop token")
             yield {"choices": [{"delta": {"content": ""}, "finish_reason": "stop"}]}
+            
+            logger.info(f"🔥 MULTI-VIDEO: COMPLETED STREAMING - successful: {successful_count}, failed: {failed_count}")
             
         except Exception as e:
             logger.error(f"Streaming multi-video summarization error: {e}")
@@ -608,36 +744,53 @@ class TwelveLabsModel(CustomModelBase):
         return pegasus_index_id
     
     def ensure_video_uploaded(self, vss_file_id: str) -> Dict:
+        logger.info(f"Ensuring video uploaded for VSS ID: {vss_file_id}")
+        
         try:
             marengo_index_id = self._get_marengo_index_id()
             pegasus_index_id = self._get_pegasus_index_id()
         except Exception as e:
-            logger.error(f"Failed to get indexes: {e}")
+            logger.error(f"Failed to get indexes for VSS ID {vss_file_id}: {e}")
             return {"text": f"Failed to initialize indexes: {str(e)}", "error": True}
         
         mapping = VideoIDMapper.get_mapping(vss_file_id)
         marengo_video_id = mapping.get("marengo_video_id") if mapping else None
         pegasus_video_id = mapping.get("pegasus_video_id") if mapping else None
         
+        logger.info(f"VSS ID {vss_file_id}: existing mapping - Marengo: {marengo_video_id}, Pegasus: {pegasus_video_id}")
+        
         video_path = VideoIDMapper.get_video_path(vss_file_id)
         if not video_path:
+            logger.error(f"Video file not found for VSS ID: {vss_file_id}")
             return {"text": f"Video file not found for ID: {vss_file_id}", "error": True}
         
+        logger.info(f"VSS ID {vss_file_id}: video path found at {video_path}")
+        
         if not marengo_video_id:
-            logger.info(f"Uploading video to Marengo index")
+            logger.info(f"VSS ID {vss_file_id}: uploading to Marengo index {marengo_index_id}")
             marengo_result = self._upload_video_to_index(video_path, marengo_index_id, "marengo")
             if marengo_result.get("error"):
+                logger.error(f"VSS ID {vss_file_id}: Marengo upload failed - {marengo_result.get('text')}")
                 return marengo_result
             marengo_video_id = marengo_result.get("video_id")
             VideoIDMapper.save_mapping(vss_file_id, marengo_video_id=marengo_video_id, marengo_index_id=marengo_index_id)
+            logger.info(f"VSS ID {vss_file_id}: Marengo upload successful, video ID: {marengo_video_id}")
+        else:
+            logger.info(f"VSS ID {vss_file_id}: Marengo video already exists with ID: {marengo_video_id}")
         
         if not pegasus_video_id:
-            logger.info(f"Uploading video to Pegasus index")
+            logger.info(f"VSS ID {vss_file_id}: uploading to Pegasus index {pegasus_index_id}")
             pegasus_result = self._upload_video_to_index(video_path, pegasus_index_id, "pegasus")
             if pegasus_result.get("error"):
+                logger.error(f"VSS ID {vss_file_id}: Pegasus upload failed - {pegasus_result.get('text')}")
                 return pegasus_result
             pegasus_video_id = pegasus_result.get("video_id")
             VideoIDMapper.save_mapping(vss_file_id, pegasus_video_id=pegasus_video_id, pegasus_index_id=pegasus_index_id)
+            logger.info(f"VSS ID {vss_file_id}: Pegasus upload successful, video ID: {pegasus_video_id}")
+        else:
+            logger.info(f"VSS ID {vss_file_id}: Pegasus video already exists with ID: {pegasus_video_id}")
+        
+        logger.info(f"VSS ID {vss_file_id}: upload check completed successfully - Marengo: {marengo_video_id}, Pegasus: {pegasus_video_id}")
         
         return {
             "marengo_video_id": marengo_video_id,
@@ -666,12 +819,22 @@ class TwelveLabsModel(CustomModelBase):
             )
             
             logger.info(f"Waiting for {model_name} upload task {task.id} to complete...")
-            task_result = wait_for_task_completion(self._client, task.id)
             
-            if task_result.get("status") != "ready":
-                return {"text": f"{model_name} upload failed: {task_result.get('error', 'Unknown error')}", "error": True}
+            # Use TwelveLabs' built-in method that waits for full indexing completion
+            def on_task_update(task_obj):
+                logger.info(f"  {model_name} task status: {task_obj.status}")
             
-            video_id = task_result.get("video_id")
+            try:
+                completed_task = task.wait_for_done(callback=on_task_update)
+                logger.info(f"{model_name} indexing completed with status: {completed_task.status}")
+                
+                if completed_task.status != "ready":
+                    return {"text": f"{model_name} indexing failed with status: {completed_task.status}", "error": True}
+                
+                video_id = completed_task.video_id
+            except Exception as e:
+                logger.error(f"{model_name} wait_for_done failed: {e}")
+                return {"text": f"{model_name} indexing wait failed: {str(e)}", "error": True}
             logger.info(f"{model_name} upload successful, video ID: {video_id}")
             return {"video_id": video_id}
             

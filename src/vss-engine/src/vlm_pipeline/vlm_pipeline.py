@@ -475,6 +475,22 @@ class DecoderProcess(ViaProcessBase):
         )
         self._live_stream_handle_info.pop(live_stream_id)
 
+    def _skip_frame_extraction(self, **kwargs):
+        """Skip frame extraction for TwelveLabs model - return empty frames since processing happens remotely"""
+        chunk = kwargs.get("chunk")
+        logger.info(f"Skipping frame extraction for TwelveLabs model, chunk: {chunk}")
+        
+        # Return structure similar to _decode_chunk but with empty frames
+        return {
+            "chunk": chunk,
+            "chunk_id": kwargs.get("chunk_id", 0),
+            "frames": [],  # Empty frames - TwelveLabs processes videos remotely
+            "frame_times": [],  # Empty frame times
+            "audio_frames": [],  # No audio frames needed
+            "request_params": kwargs.get("request_params"),
+            "is_warmup": False,
+        }
+
     def _deinitialize(self):
         for fgetter in self._fgetters:
             fgetter.destroy_pipeline()
@@ -486,6 +502,10 @@ class DecoderProcess(ViaProcessBase):
         """Decode a chunk and return selected frames as raw frames / JPEG images"""
         if self._vlm_model_type == VlmModelType.NVILA:
             return self._file_thread_pool.submit(self._decode_chunk, self._fgetters.pop(), **kwargs)
+        elif self._vlm_model_type == VlmModelType.TWELVE_LABS:
+            # TwelveLabs processes videos on their cloud service, skip local frame extraction
+            # Return empty frames/tensors since TwelveLabsContext handles video processing remotely
+            return self._thread_pool.submit(self._skip_frame_extraction, **kwargs)
         else:
             return self._thread_pool.submit(self._decode_chunk, self._fgetters.pop(), **kwargs)
 

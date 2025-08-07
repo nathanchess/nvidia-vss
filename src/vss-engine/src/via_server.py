@@ -1981,6 +1981,9 @@ class ViaServer:
             asset = self._asset_manager.get_asset(videoId)
 
             llm_generation_config = {}
+            # Add model information for proper routing
+            if query.model:
+                llm_generation_config["model"] = query.model
             # Extract user specified llm output parameters
             if query.max_tokens is not None:
                 llm_generation_config["max_new_tokens"] = query.max_tokens
@@ -2518,6 +2521,9 @@ class ViaServer:
             logger.debug(f"Q&A; messages={query.messages}")
 
             llm_generation_config = {}
+            # Add model information for proper routing
+            if query.model:
+                llm_generation_config["model"] = query.model
             # Extract user specified llm output parameters
             if query.max_tokens is not None:
                 llm_generation_config["max_new_tokens"] = query.max_tokens
