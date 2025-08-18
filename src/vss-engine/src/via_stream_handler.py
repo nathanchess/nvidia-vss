@@ -44,7 +44,7 @@ from tabulate import tabulate
 from vss_ctx_rag.context_manager import ContextManager
 
 from asset_manager import Asset
-from chunk_info import ChunkInfo
+from chunk_info import ChunkInfo, get_timestamp_str
 from cv_pipeline import CVPipeline
 from utils import MediaFileInfo, process_highlight_request
 from via_exception import ViaException
