@@ -44,14 +44,30 @@ class UploadHandlerRegistry:
             return None
         
         def upload_callback(asset):
+            # Run upload handlers in background tasks to avoid blocking
+            import asyncio
             for handler_config in self.handlers:
                 if handler_config['filter'](asset):
                     try:
-                        handler_config['handler'](asset)
+                        # Check if handler is async
+                        if asyncio.iscoroutinefunction(handler_config['handler']):
+                            # Create background task for async handlers
+                            asyncio.create_task(self._run_async_handler(handler_config, asset))
+                        else:
+                            # Run sync handlers in thread pool to avoid blocking
+                            loop = asyncio.get_event_loop()
+                            loop.run_in_executor(None, handler_config['handler'], asset)
                     except Exception as e:
                         logger.error(f"[{handler_config['name']}] Upload handler failed: {e}")
         
         return upload_callback
+    
+    async def _run_async_handler(self, handler_config, asset):
+        """Run an async upload handler with error handling."""
+        try:
+            await handler_config['handler'](asset)
+        except Exception as e:
+            logger.error(f"[{handler_config['name']}] Async upload handler failed: {e}")
     
     def load_handlers_from_config(self):
         """Load handlers based on environment configuration."""

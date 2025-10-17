@@ -28,16 +28,17 @@ def register_upload_handlers(registry):
     try:
         model = TwelveLabsModel()
         
-        def upload_handler(asset):
+        async def upload_handler(asset):
             try:
-                result = model.ensure_video_uploaded(asset.asset_id)
+                # Use the new async method that doesn't block
+                result = await model.ensure_video_uploaded_async(asset.asset_id)
                 if result.get("error"):
                     logger.error(f"Upload failed: {result.get('text')}")
                 else:
                     logger.info("Upload successful")
             except Exception as e:
                 logger.error(f"Upload error: {e}")
-                raise
+                # Don't re-raise to avoid crashing the background task
         
         registry.register_handler(
             name="Twelve Labs",

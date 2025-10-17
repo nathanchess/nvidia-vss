@@ -797,6 +797,61 @@ class TwelveLabsModel(CustomModelBase):
             "pegasus_video_id": pegasus_video_id
         }
     
+    async def ensure_video_uploaded_async(self, vss_file_id: str) -> Dict:
+        """Async version that uses non-blocking polling"""
+        logger.info(f"Ensuring video uploaded for VSS ID: {vss_file_id}")
+        
+        try:
+            marengo_index_id = self._get_marengo_index_id()
+            pegasus_index_id = self._get_pegasus_index_id()
+        except Exception as e:
+            logger.error(f"Failed to get indexes for VSS ID {vss_file_id}: {e}")
+            return {"text": f"Failed to initialize indexes: {str(e)}", "error": True}
+        
+        mapping = VideoIDMapper.get_mapping(vss_file_id)
+        marengo_video_id = mapping.get("marengo_video_id") if mapping else None
+        pegasus_video_id = mapping.get("pegasus_video_id") if mapping else None
+        
+        logger.info(f"VSS ID {vss_file_id}: existing mapping - Marengo: {marengo_video_id}, Pegasus: {pegasus_video_id}")
+        
+        video_path = VideoIDMapper.get_video_path(vss_file_id)
+        if not video_path:
+            logger.error(f"Video file not found for VSS ID: {vss_file_id}")
+            return {"text": f"Video file not found for ID: {vss_file_id}", "error": True}
+        
+        logger.info(f"VSS ID {vss_file_id}: video path found at {video_path}")
+        
+        if not marengo_video_id:
+            logger.info(f"VSS ID {vss_file_id}: uploading to Marengo index {marengo_index_id}")
+            marengo_result = await self._upload_video_to_index_async(video_path, marengo_index_id, "marengo")
+            if marengo_result.get("error"):
+                logger.error(f"VSS ID {vss_file_id}: Marengo upload failed - {marengo_result.get('text')}")
+                return marengo_result
+            marengo_video_id = marengo_result.get("video_id")
+            VideoIDMapper.save_mapping(vss_file_id, marengo_video_id=marengo_video_id, marengo_index_id=marengo_index_id)
+            logger.info(f"VSS ID {vss_file_id}: Marengo upload successful, video ID: {marengo_video_id}")
+        else:
+            logger.info(f"VSS ID {vss_file_id}: Marengo video already exists with ID: {marengo_video_id}")
+        
+        if not pegasus_video_id:
+            logger.info(f"VSS ID {vss_file_id}: uploading to Pegasus index {pegasus_index_id}")
+            pegasus_result = await self._upload_video_to_index_async(video_path, pegasus_index_id, "pegasus")
+            if pegasus_result.get("error"):
+                logger.error(f"VSS ID {vss_file_id}: Pegasus upload failed - {pegasus_result.get('text')}")
+                return pegasus_result
+            pegasus_video_id = pegasus_result.get("video_id")
+            VideoIDMapper.save_mapping(vss_file_id, pegasus_video_id=pegasus_video_id, pegasus_index_id=pegasus_index_id)
+            logger.info(f"VSS ID {vss_file_id}: Pegasus upload successful, video ID: {pegasus_video_id}")
+        else:
+            logger.info(f"VSS ID {vss_file_id}: Pegasus video already exists with ID: {pegasus_video_id}")
+        
+        logger.info(f"VSS ID {vss_file_id}: upload check completed successfully - Marengo: {marengo_video_id}, Pegasus: {pegasus_video_id}")
+        
+        return {
+            "marengo_video_id": marengo_video_id,
+            "pegasus_video_id": pegasus_video_id
+        }
+    
     def _upload_video_to_index(self, video_path, index_id: str, model_name: str) -> Dict:
         try:
             logger.info(f"Uploading to {model_name}: video_path={video_path}, index_id={index_id}")
@@ -837,6 +892,68 @@ class TwelveLabsModel(CustomModelBase):
                 return {"text": f"{model_name} indexing wait failed: {str(e)}", "error": True}
             logger.info(f"{model_name} upload successful, video ID: {video_id}")
             return {"video_id": video_id}
+            
+        except Exception as e:
+            logger.error(f"Error uploading to {model_name}: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            return {"text": f"Video upload failed: {str(e)}", "error": True}
+    
+    async def _upload_video_to_index_async(self, video_path, index_id: str, model_name: str) -> Dict:
+        """Async version that polls task status without blocking"""
+        try:
+            logger.info(f"Uploading to {model_name}: video_path={video_path}, index_id={index_id}")
+            logger.info(f"File exists: {video_path.exists()}, File size: {video_path.stat().st_size if video_path.exists() else 'N/A'}")
+            logger.info(f"Client initialized: {self._client is not None}")
+            
+            if not video_path.exists():
+                return {"text": f"Video file not found: {video_path}", "error": True}
+            
+            if not index_id:
+                return {"text": f"No index ID provided for {model_name}", "error": True}
+            
+            if not self._client:
+                return {"text": f"Twelve Labs client not initialized", "error": True}
+            
+            logger.info(f"Creating upload task for {model_name} with index {index_id}")
+            task = self._client.task.create(
+                index_id=index_id,
+                file=str(video_path)
+            )
+            
+            logger.info(f"Starting async polling for {model_name} upload task {task.id}...")
+            
+            # Poll task status asynchronously instead of using blocking wait_for_done
+            import asyncio
+            max_attempts = 120  # 10 minutes max (5 second intervals)
+            attempt = 0
+            
+            while attempt < max_attempts:
+                try:
+                    # Get task status without blocking
+                    task_status = self._client.task.retrieve(task.id)
+                    logger.info(f"  {model_name} task status: {task_status.status}")
+                    
+                    if task_status.status == "ready":
+                        logger.info(f"{model_name} indexing completed with status: {task_status.status}")
+                        video_id = task_status.video_id
+                        logger.info(f"{model_name} upload successful, video ID: {video_id}")
+                        return {"video_id": video_id}
+                    elif task_status.status in ["failed", "error"]:
+                        logger.error(f"{model_name} indexing failed with status: {task_status.status}")
+                        return {"text": f"{model_name} indexing failed with status: {task_status.status}", "error": True}
+                    
+                    # Wait 5 seconds before next poll
+                    await asyncio.sleep(5)
+                    attempt += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error polling {model_name} task status: {e}")
+                    await asyncio.sleep(5)
+                    attempt += 1
+            
+            # Timeout
+            logger.error(f"{model_name} upload timed out after {max_attempts * 5} seconds")
+            return {"text": f"{model_name} upload timed out", "error": True}
             
         except Exception as e:
             logger.error(f"Error uploading to {model_name}: {e}")
