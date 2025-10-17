@@ -42,6 +42,7 @@ import uvicorn
 from fastapi import FastAPI, File, Form, Path, Query, Request, Response, UploadFile
 from fastapi.exceptions import HTTPException, RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import (
     GC_COLLECTOR,
     PLATFORM_COLLECTOR,
@@ -1416,6 +1417,15 @@ class ViaServer:
         self._app.config = {}
         self._app.config["host"] = args.host
         self._app.config["port"] = args.port
+
+        # Add CORS middleware to allow frontend access
+        self._app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://0.0.0.0:3000"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
         self._setup_routes()
         self._setup_exception_handlers()
