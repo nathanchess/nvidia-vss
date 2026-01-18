@@ -1,0 +1,10 @@
+# Handle line endings automatically for files detected as text
+* text=auto
+
+# Force Unix line endings for shell scripts (critical for Docker builds)
+*.sh text eol=lf
+
+# Force Unix line endings for other Linux-specific files
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
