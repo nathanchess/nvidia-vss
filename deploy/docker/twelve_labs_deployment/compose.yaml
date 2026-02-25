@@ -27,16 +27,22 @@ services:
       args:
         BASE_IMAGE: ${VIA_IMAGE:-nvcr.io/nvidia/blueprint/vss-engine:2.3.1}
     shm_size: '16gb'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
-#    Disabled GPU deployment for Twelve Labs integration.
+    #    Disabled GPU deployment for Twelve Labs integration.
 
-#    deploy:
-#      resources:
-#        reservations:
-#          devices:
-#            - driver: nvidia
-#              count: all
-#              capabilities: [gpu]
+    #    deploy:
+    #      resources:
+    #        reservations:
+    #          devices:
+    #            - driver: nvidia
+    #              count: all
+    #              capabilities: [gpu]
     ports:
       - "${BACKEND_PORT?}:${BACKEND_PORT?}"
       - "${FRONTEND_PORT?}:${FRONTEND_PORT?}"
@@ -69,7 +75,7 @@ services:
       TWELVE_LABS_MAX_CLIPS: "${TWELVE_LABS_MAX_CLIPS}"
       TWELVE_LABS_UPLOAD_TIMEOUT: "${TWELVE_LABS_UPLOAD_TIMEOUT}"
       VSS_ENABLE_TWELVE_LABS_AUTO_UPLOAD: "${VSS_ENABLE_TWELVE_LABS_AUTO_UPLOAD}"
-      
+
       # Core VSS Configuration
       ASSET_STORAGE_DIR: "${ASSET_STORAGE_DIR}"
       BACKEND_PORT: "${BACKEND_PORT}"
@@ -90,7 +96,6 @@ services:
     tty: true
     extra_hosts:
       host.docker.internal: host-gateway
-
 
 volumes:
   via-hf-cache:
