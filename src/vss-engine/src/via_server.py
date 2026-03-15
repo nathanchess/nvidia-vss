@@ -1418,12 +1418,16 @@ class ViaServer:
         self._app.config["host"] = args.host
         self._app.config["port"] = args.port
 
-        # Add CORS middleware to allow frontend access
+        # Add CORS middleware to allow frontend access safely
         self._app.add_middleware(
             CORSMiddleware,
-            allow_origins=["*"],  # Allow all origins for easier deployment
+            allow_origins=[
+                "https://tl-vss-compliance-demo.com",
+                "http://localhost:3000",
+                "http://127.0.0.1:3000"
+            ],
             allow_credentials=True,
-            allow_methods=["*"],
+            allow_methods=["GET", "POST", "OPTIONS"], 
             allow_headers=["*"],
         )
 
