@@ -43,6 +43,7 @@ services:
     #            - driver: nvidia
     #              count: all
     #              capabilities: [gpu]
+    user: "1000:1000"  # Run as non-root user inside the container
     ports:
       - "${BACKEND_PORT?}:${BACKEND_PORT?}"
       - "${FRONTEND_PORT?}:${FRONTEND_PORT?}"

@@ -76,6 +76,10 @@ from gi.repository import GstRtsp  # noqa: E402
 
 API_PREFIX = ""
 
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "").strip()
+API_KEY_HEADER_NAME = "X-API-Key"
+EXEMPT_PATHS = {"/health/ready", "/health/live"}
+
 # Remove some default metrics reported by prometheus client.
 REGISTRY.unregister(PROCESS_COLLECTOR)
 REGISTRY.unregister(PLATFORM_COLLECTOR)
@@ -1430,6 +1434,22 @@ class ViaServer:
             allow_methods=["GET", "POST", "OPTIONS"], 
             allow_headers=["*"],
         )
+
+        @self._app.middleware("http")
+        async def api_key_guard(request: Request, call_next):
+            path = request.url.path
+            if path in EXEMPT_PATHS:
+                return await call_next(request)
+
+            # If no key is configured at all, fail closed so we don't accidentally expose
+            if not INTERNAL_API_KEY:
+                return JSONResponse(status_code=500, content={"detail": "INTERNAL_API_KEY not configured on backend"})
+
+            provided = request.headers.get(API_KEY_HEADER_NAME)
+            if provided != INTERNAL_API_KEY:
+                return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+
+            return await call_next(request)
 
         self._setup_routes()
         self._setup_exception_handlers()
